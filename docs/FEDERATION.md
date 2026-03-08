@@ -1,6 +1,6 @@
 # FLUX Federation
 
-**Requires:** FLUX 2.0.0+ / API version 2.0.0
+**Requires:** FLUX 2.0.0+ / API version 2.1.1
 
 Federation lets users on different FLUX servers send messages to each other using human-readable addresses like `alice@server-a.com` → `bob@server-b.com`.
 
@@ -25,6 +25,8 @@ Server A:
 ```
 
 The federation resolve endpoint only returns the public key and address — never credentials or private information.
+
+**Note:** FLUX uses HTTPS by default for all federated server-to-server communication. HTTP is only used for localhost or when a port is explicitly specified (development mode).
 
 ---
 
@@ -56,7 +58,7 @@ Discovery endpoint. Returns metadata about this node.
 {
   "ok": true,
   "domain": "server-b.com",
-  "version": "2.0.0",
+  "version": "2.1.1",
   "protocol": "1.0",
   "federation": true
 }
@@ -102,9 +104,12 @@ python test_client.py --server http://localhost:8766
 
 ## Security
 
-- The resolve endpoint is public and unauthenticated — it only exposes what a public directory would.
-- Message signatures are always verified end-to-end. A malicious server cannot forge messages from its users.
-- Address resolution results are cached for 5 minutes (`federation.CACHE_TTL`).
+- **HTTPS by default:** All federated server-to-server communication uses HTTPS to protect against man-in-the-middle attacks. HTTP is only used for localhost or explicit port specifications (development mode).
+- **Public endpoints:** The resolve endpoint is public and unauthenticated — it only exposes what a public directory would.
+- **Message integrity:** Message signatures are always verified end-to-end. A malicious server cannot forge messages from its users.
+- **Tamper detection:** If a message passes through a malicious relay that modifies it, the integrity chain detects the tampering. The detecting server broadcasts a validated tamper report to all servers in the message's route and mesh peers.
+- **Tamper report validation:** Servers receiving tamper reports verify the integrity chain to confirm actual tampering occurred before recording strikes. This prevents malicious actors from sending fabricated reports to frame innocent servers.
+- **Cache:** Address resolution results are cached for 5 minutes (`federation.CACHE_TTL`).
 
 ---
 
@@ -118,6 +123,7 @@ Federation and mesh solve different problems:
 | Trust model | Public (anyone can resolve) | Shared token (trusted peers only) |
 | Message ownership | Sender signs, recipient is on remote server | Same message relayed to multiple stores |
 | Config | Automatic via DNS/domain | Explicit `mesh.config.json` |
+| Tamper broadcast | Reports sent to route servers + mesh peers | Reports sent to mesh peers only |
 
 A server can use both simultaneously.
 

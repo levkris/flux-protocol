@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 FLUX_VERSION = "1.0"
-FLUX_API_VERSION = "2.1.0"
+FLUX_API_VERSION = "2.1.1"
 
 MAX_CONTENT_BYTES = 65_536
 MAX_PENDING_PER_ADDRESS = 500

@@ -4,7 +4,7 @@
 
 No usernames. No passwords. No MIME types. No trust-by-reputation DNS games. Your identity is a keypair. Your address is derived from your public key. Every message is signed. Every hop is hashed. Tampering is automatically detected, reported, and punished.
 
-**Current version: 2.1.0** — see [CHANGELOG](#changelog) below.
+**Current version: 2.1.1** — see [CHANGELOG](#changelog) below.
 
 ---
 
@@ -72,6 +72,16 @@ docker compose logs flux
 | `FLUX_HOST` | `0.0.0.0` | Bind address |
 | `FLUX_DOMAIN` | — | Domain for federated addressing. **Required** for account system. |
 
+### Security Best Practices
+
+**FLUX_SECRET:**
+- Generate a cryptographically random secret (64+ characters)
+- Use `openssl rand -hex 32` or similar
+- Never commit to version control
+- Each server operator sets their own secret (federated systems)
+- Rotate immediately if compromise suspected
+- See [FLUX_SECRET Rotation Guide](#flux_secret-rotation) below
+
 ---
 
 ## Security Architecture
@@ -119,17 +129,25 @@ When a server or recipient detects a hash mismatch in the integrity chain, it:
 
 1. **Identifies the offending server** — the hop whose hash doesn't match.
 2. **Records a strike** against that server locally.
-3. **Broadcasts a signed TamperReport** to all known mesh peers, *excluding the offending server*.
+3. **Broadcasts a signed TamperReport** to:
+   - All known mesh peers
+   - All servers that appear in the message's route
+   - **Excludes the offending server itself**
 
 ```
 Server A detects tampering by Relay-X
   → strikes Relay-X locally
-  → broadcasts TamperReport to Server B, Server C, Server D
+  → broadcasts TamperReport to:
+     • Mesh peers (Server B, Server C, Server D)
+     • All servers in message route
      (NOT to Relay-X)
-  → B, C, D each strike Relay-X
+  → Recipients verify the report contains proof of tampering
+  → Each server strikes Relay-X independently
 ```
 
 When a server accumulates **3 strikes** (configurable via `TRUST_THRESHOLD`), it is **quarantined**: all future messages that passed through it are rejected. No administrator action required — the network heals itself.
+
+**Anti-Fraud Protection:** Tamper reports are validated before acceptance. Each server independently verifies the integrity chain in the report to confirm actual tampering occurred. This prevents malicious actors from sending fabricated reports to frame innocent servers.
 
 This creates a strong economic incentive: any server that tampers with messages will be ejected from the network automatically as reports propagate.
 
@@ -137,7 +155,7 @@ This creates a strong economic incentive: any server that tampers with messages 
 
 | Method | Route | Description |
 |---|---|---|
-| POST | `/integrity/tamper_report` | Receive a tamper report from a peer |
+| POST | `/integrity/tamper_report` | Receive a tamper report from a peer (validated before acceptance) |
 | GET | `/integrity/reputation` | View current strikes and quarantine list |
 | POST | `/integrity/verify` | Verify a message's signature + integrity chain |
 
@@ -203,6 +221,24 @@ A built-in heuristic spam filter runs on every incoming message before it is sto
 
 Spam is rejected with HTTP 451 before storage. No message is ever delivered to the recipient's inbox.
 
+**Note:** Server operators can replace the built-in spam filter with custom implementations (Bayesian, ML-based, etc.) as needed.
+
+---
+
+### 6 — Federation Security (HTTPS by Default)
+
+FLUX uses **HTTPS by default** for all federated server-to-server communication. HTTP is only used for localhost or when a port is explicitly specified (development mode).
+
+```python
+# Production: alice@server-a.com → bob@server-b.com
+# Uses: https://server-b.com/federation/resolve/bob
+
+# Development: alice@localhost:8765 → bob@localhost:8766
+# Uses: http://localhost:8766/federation/resolve/bob
+```
+
+This protects against man-in-the-middle attacks during address resolution and message delivery between federated servers.
+
 ---
 
 ## Using as a Library
@@ -264,7 +300,7 @@ Connect multiple FLUX servers into a unified delivery network. Configure `mesh.c
 
 Three delivery modes: `broadcast` (all peers), `chain` (first success), `hybrid` (route to recipient's online server, fall back to broadcast).
 
-Tamper reports are automatically broadcast through the same mesh peer list.
+Tamper reports are automatically broadcast through the mesh peer list AND to all servers that appear in the tampered message's route.
 
 ---
 
@@ -317,6 +353,56 @@ The store is fully pluggable via `flux/store.py`. To add a new backend (Redis, P
 
 ---
 
+## FLUX_SECRET Rotation
+
+### When to Rotate
+
+**Rotate immediately if:**
+- You suspect the secret has been compromised
+- The secret was accidentally committed to version control
+- A developer/operator with access to the secret leaves your organization
+
+**Optional periodic rotation:**
+- Some security policies require credential rotation every 3-5 years
+- This is a per-server operator decision in federated deployments
+
+### How to Rotate
+
+1. **Generate new secret:**
+   ```bash
+   openssl rand -hex 32
+   ```
+
+2. **Update server configuration:**
+   ```bash
+   # Update .env or environment variable
+   FLUX_SECRET=<new-secret>
+   ```
+
+3. **Restart server:**
+   ```bash
+   docker compose restart flux
+   # or
+   systemctl restart flux
+   ```
+
+4. **For raw FLUX protocol clients (non-account-based):**
+   - Clients must update their FLUX_SECRET environment variable
+   - This causes temporary authentication downtime
+
+5. **Account-based users are unaffected:**
+   - Session tokens are stored in database, not derived from FLUX_SECRET
+   - No action required from account-based users
+
+### Impact Assessment
+
+- **Account system users:** No impact (sessions stored in DB)
+- **Raw FLUX protocol users:** Must update FLUX_SECRET on client side
+- **Other servers in federation:** No impact (each server has independent secret)
+- **Downtime:** Brief window during rotation for raw protocol clients
+
+---
+
 ## Protocol
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full specification.
@@ -336,6 +422,12 @@ The `v` field in message envelopes (`"1.0"`) is the **wire protocol version**, v
 ---
 
 ## Changelog
+
+### 2.1.1
+**Security improvements:**
+- **HTTPS by default** — federation now uses HTTPS for all server-to-server communication. HTTP is only used for localhost or explicit port specifications (development mode).
+- **Tamper report validation** — servers now verify that tamper reports contain actual proof of tampering by checking the integrity chain. This prevents malicious actors from sending fabricated reports to frame innocent servers.
+- **Enhanced quarantine broadcast** — tamper reports are now sent to all servers in the message's route in addition to mesh peers, enabling faster network-wide detection of malicious relays.
 
 ### 2.1.0
 **New features:**
@@ -361,6 +453,32 @@ The `v` field in message envelopes (`"1.0"`) is the **wire protocol version**, v
 
 ### 1.0.0
 Initial release.
+
+---
+
+## Operating a FLUX Server
+
+### Deployment Considerations
+
+**Storage Management:**
+- Messages are persistent (soft-delete only)
+- Configure retention policies based on your storage capacity
+- Monitor disk usage and implement archival strategies as needed
+
+**Reputation System:**
+- Reputation is local to each server (not shared across the network)
+- Coordinate quarantine lists with trusted peers via out-of-band channels if desired
+- Each server operator makes independent trust decisions
+
+**Spam Protection:**
+- Built-in heuristic filter is a baseline
+- Consider implementing ML-based filtering for high-traffic deployments
+- Server operators can replace the spam module with custom implementations
+
+**Monitoring:**
+- Check `/stats` endpoint for server health metrics
+- Monitor `/integrity/reputation` for quarantined servers
+- Track storage growth and plan capacity accordingly
 
 ---
 

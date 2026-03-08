@@ -16,6 +16,14 @@ from .spam import is_spam
 log = logging.getLogger("flux.ws")
 
 
+def _server_to_url(server: str) -> str:
+    """Convert a server domain to a full URL (HTTPS by default, HTTP for localhost/ports)."""
+    if server.startswith("http"):
+        return server.rstrip("/")
+    scheme = "http" if ("localhost" in server.lower() or ":" in server) else "https"
+    return f"{scheme}://{server}"
+
+
 def make_ws_handler(store, presence, domain: str = "", mesh_relay=None):
 
     def _known_peers() -> list[str]:
@@ -26,15 +34,24 @@ def make_ws_handler(store, presence, domain: str = "", mesh_relay=None):
             peers.extend(cfg.get("peers", []))
         return list(set(peers))
 
-    async def _broadcast_tamper(report: dict, offender: str):
+    def _tamper_report_targets(msg: dict) -> list[str]:
+        """Get broadcast targets: mesh peers + all servers in message route."""
+        targets = set(_known_peers())
+        for hop in msg.get("route", []):
+            server = hop.get("server", "")
+            if server:
+                targets.add(_server_to_url(server))
+        return list(targets)
+
+    async def _broadcast_tamper(report: dict, targets: list[str], offender: str):
         import asyncio
         import aiohttp as _aio
         async with _aio.ClientSession() as session:
-            for peer in _known_peers():
-                if offender in peer:
+            for target in targets:
+                if offender.lower() in target.lower():
                     continue
                 try:
-                    await session.post(f"{peer}/integrity/tamper_report", json=report,
+                    await session.post(f"{target}/integrity/tamper_report", json=report,
                                        timeout=_aio.ClientTimeout(total=5))
                 except Exception:
                     pass
@@ -98,10 +115,11 @@ def make_ws_handler(store, presence, domain: str = "", mesh_relay=None):
                         chain_ok, offender = verify_integrity_chain(msg)
                         if not chain_ok and offender:
                             record_tamper(offender)
-                            import asyncio
-                            asyncio.create_task(_broadcast_tamper(
-                                build_tamper_report(msg, offender, domain or request.host), offender
-                            ))
+                            report = build_tamper_report(msg, offender, domain or request.host)
+                            targets = _tamper_report_targets(msg)
+                            if targets:
+                                import asyncio
+                                asyncio.create_task(_broadcast_tamper(report, targets, offender))
                             await ws.send_str(json.dumps({"ok": False, "error": "integrity chain violated"}))
                             continue
 
@@ -115,7 +133,6 @@ def make_ws_handler(store, presence, domain: str = "", mesh_relay=None):
 
                         inbox = "spam" if spam_result["spam"] else DEFAULT_INBOX
 
-                        # Spam is never pushed in realtime — always stored in the spam inbox
                         if not spam_result["spam"] and await presence.deliver(msg_clean["to"], {"type": "msg", "msg": msg_clean}):
                             delivery = "realtime"
                             result = True

@@ -5,9 +5,15 @@
 | Thing | Value | Notes |
 |---|---|---|
 | Protocol (`v` field) | `1.0` | Wire format version. Only bumps when signing algorithm or required fields change. |
-| Software / API | `2.1.0` | Semver. Returned by `/health` and `/federation/info`. |
+| Software / API | `2.1.1` | Semver. Returned by `/health` and `/federation/info`. |
 
 ### Changelog
+
+#### 2.1.1
+**Security improvements:**
+- **HTTPS by default:** Federation now uses HTTPS for all server-to-server communication. HTTP is only used for localhost or explicit port specifications (development mode).
+- **Tamper report validation:** Servers verify that tamper reports contain actual proof of tampering by checking the integrity chain. This prevents malicious actors from sending fabricated reports to frame innocent servers.
+- **Enhanced quarantine broadcast:** Tamper reports are now sent to all servers in the message's route in addition to mesh peers, enabling faster network-wide detection of malicious relays.
 
 #### 2.1.0
 **Added:**
@@ -44,6 +50,7 @@ Initial release.
 - **Messages are never destroyed.** Deletion is a status change.
 - **Content is content.** Plain UTF-8. No MIME types.
 - **Encryption is first-class.** E2E encryption is built in, not bolted on.
+- **Federation over HTTPS.** Server-to-server communication uses HTTPS by default.
 
 ---
 
@@ -151,7 +158,10 @@ To verify the chain:
 
 ### TamperReport
 
-When tampering is detected, a signed report is broadcast to all known peers **except the offending server**:
+When tampering is detected, a signed report is broadcast to:
+- All known mesh peers
+- All servers that appear in the message's route
+- **Excludes the offending server itself**
 
 ```json
 {
@@ -167,11 +177,14 @@ When tampering is detected, a signed report is broadcast to all known peers **ex
 }
 ```
 
-Each server that receives a valid TamperReport:
-1. Verifies the report's signature.
-2. Records a strike against the offender.
-3. Quarantines the offender when strikes reach `TRUST_THRESHOLD` (default 3).
-4. Rejects any future message that passed through a quarantined server.
+Each server that receives a TamperReport:
+1. **Validates the report** by verifying the integrity chain contains proof of actual tampering by the claimed offender.
+2. Verifies the report's signature.
+3. Records a strike against the offender.
+4. Quarantines the offender when strikes reach `TRUST_THRESHOLD` (default 3).
+5. Rejects any future message that passed through a quarantined server.
+
+**Anti-fraud protection:** The validation step prevents malicious actors from sending fabricated reports to frame innocent servers. A server will only record a strike if the integrity chain proves the offender actually tampered with the message.
 
 ---
 
@@ -337,13 +350,13 @@ Server-wide statistics.
 
 ### GET /health
 ```json
-{ "ok": true, "protocol": "1.0", "version": "2.1.0" }
+{ "ok": true, "protocol": "1.0", "version": "2.1.1" }
 ```
 
 ---
 
 ### POST /integrity/tamper_report
-Receive a tamper report from a peer. Verifies signature, records strike, quarantines if threshold reached.
+Receive a tamper report from a peer. Validates the integrity chain to confirm actual tampering, verifies signature, records strike, quarantines if threshold reached.
 
 ---
 
@@ -408,7 +421,7 @@ token = SHA-256("flux:" + address + ":" + FLUX_SECRET)
 
 ## Mesh System
 
-See `mesh.config.example.json` and the main README for full details. Tamper reports are automatically forwarded to mesh peers.
+See `mesh.config.example.json` and the main README for full details. Tamper reports are automatically forwarded to mesh peers and all servers in the message's route.
 
 ---
 

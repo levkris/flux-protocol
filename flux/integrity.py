@@ -30,7 +30,6 @@ def set_server_identity(identity: FluxIdentity):
 
 
 def _integrity_payload(msg: dict) -> str:
-    # bcc is excluded here too — it's stripped before storage and must not affect the hash
     EXCLUDE = {"sig", "pub", "route", "integrity_chain", "_status", "_inbox", "_tags", "bcc"}
     core = {k: v for k, v in msg.items() if k not in EXCLUDE}
     return json.dumps(core, separators=(",", ":"), sort_keys=True)
@@ -67,7 +66,6 @@ def verify_integrity_chain(msg: dict) -> tuple[bool, Optional[str]]:
     if not chain:
         return True, None
 
-    # The hash is computed over the immutable core fields — it must be identical at every hop
     expected_hash = compute_hash({**msg, "integrity_chain": []})
 
     for hop in chain:
@@ -126,16 +124,49 @@ def build_tamper_report(msg: dict, offender: str, reporter: str) -> dict:
         "t": t,
         "sig": identity.sign(payload),
         "pub": identity.pub_b64(),
-        # Full chain included so peers can independently verify the claim
         "integrity_chain": msg.get("integrity_chain", []),
         "msg_hash_baseline": compute_hash({**msg, "integrity_chain": []}),
     }
 
 
 def verify_tamper_report(report: dict) -> bool:
+    """Verify the tamper report signature only."""
     try:
         pub_bytes = b64d(report["pub"])
         payload = f"tamper:{report['msg_id']}:{report['offender']}:{report['reporter']}:{report['t']}"
         return verify(pub_bytes, payload, report["sig"])
     except Exception:
         return False
+
+
+def validate_tamper_report(report: dict) -> bool:
+    """
+    Verify that the tamper report is legitimate by:
+    1. Checking the report signature
+    2. Verifying the integrity chain shows actual tampering by the claimed offender
+    """
+    if not verify_tamper_report(report):
+        return False
+    
+    chain = report.get("integrity_chain", [])
+    baseline = report.get("msg_hash_baseline", "")
+    offender = report.get("offender", "")
+    
+    if not chain or not baseline or not offender:
+        return False
+    
+    for hop in chain:
+        server = hop.get("server", "")
+        h = hop.get("hash", "")
+        
+        try:
+            pub_bytes = b64d(hop.get("pub", ""))
+            if not verify(pub_bytes, f"{server}:{hop.get('t', 0)}:{h}", hop.get("sig", "")):
+                return False
+        except Exception:
+            return False
+        
+        if server == offender and h != baseline:
+            return True
+    
+    return False

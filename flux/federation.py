@@ -26,6 +26,13 @@ def is_local(address: str, domain: str) -> bool:
     return parsed[1].lower() == domain.lower()
 
 
+def _resolve_scheme(domain: str) -> str:
+    """Use HTTPS by default, HTTP only for localhost or when port is specified (development)."""
+    if "localhost" in domain.lower() or ":" in domain:
+        return "http"
+    return "https"
+
+
 async def resolve_address(federated: str, local_domain: str, session: aiohttp.ClientSession) -> Optional[str]:
     parsed = parse_federated(federated)
     if not parsed:
@@ -43,7 +50,7 @@ async def resolve_address(federated: str, local_domain: str, session: aiohttp.Cl
             log.debug(f"cache hit for {federated}")
             return result.get("flux_address")
 
-    scheme = "https" if ":" not in domain else "http"
+    scheme = _resolve_scheme(domain)
     url = f"{scheme}://{domain}/federation/resolve/{username}"
 
     try:
@@ -69,7 +76,7 @@ async def fetch_remote_profile(federated: str, session: aiohttp.ClientSession) -
         return None
 
     username, domain = parsed
-    scheme = "https" if ":" not in domain else "http"
+    scheme = _resolve_scheme(domain)
     url = f"{scheme}://{domain}/federation/resolve/{username}"
 
     try:

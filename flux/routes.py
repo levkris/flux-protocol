@@ -9,7 +9,7 @@ from .constants import DEFAULT_INBOX
 from .integrity import (
     append_integrity_hop, verify_integrity_chain,
     record_tamper, is_quarantined, get_reputation,
-    build_tamper_report, verify_tamper_report,
+    build_tamper_report, validate_tamper_report,
 )
 from .spam import is_spam
 
@@ -27,21 +27,30 @@ def err(msg: str, status: int = 400) -> web.Response:
     return web.json_response({"ok": False, "error": msg}, status=status)
 
 
-async def _broadcast_tamper_report(report: dict, peers: list[str], offender: str):
+def _server_to_url(server: str) -> str:
+    """Convert a server domain to a full URL (HTTPS by default, HTTP for localhost/ports)."""
+    if server.startswith("http"):
+        return server.rstrip("/")
+    scheme = "http" if ("localhost" in server.lower() or ":" in server) else "https"
+    return f"{scheme}://{server}"
+
+
+async def _broadcast_tamper_report(report: dict, targets: list[str], offender: str):
+    """Broadcast tamper report to all target servers except the offender."""
     import aiohttp as _aiohttp
     async with _aiohttp.ClientSession() as session:
-        for peer in peers:
-            if offender in peer:
+        for target in targets:
+            if offender.lower() in target.lower():
                 continue
             try:
                 async with session.post(
-                    f"{peer}/integrity/tamper_report",
+                    f"{target}/integrity/tamper_report",
                     json=report,
                     timeout=_aiohttp.ClientTimeout(total=5),
                 ) as r:
-                    log.info(f"tamper report sent to {peer}: HTTP {r.status}")
+                    log.info(f"tamper report sent to {target}: HTTP {r.status}")
             except Exception as e:
-                log.warning(f"tamper report to {peer} failed: {e}")
+                log.warning(f"tamper report to {target} failed: {e}")
 
 
 def make_routes(store, presence, domain: str = "", mesh_relay=None):
@@ -53,6 +62,15 @@ def make_routes(store, presence, domain: str = "", mesh_relay=None):
         for cfg in mesh_relay._meshes.values():
             peers.extend(cfg.get("peers", []))
         return list(set(peers))
+
+    def _tamper_report_targets(msg: dict) -> list[str]:
+        """Get broadcast targets: mesh peers + all servers in message route."""
+        targets = set(_known_peers())
+        for hop in msg.get("route", []):
+            server = hop.get("server", "")
+            if server:
+                targets.add(_server_to_url(server))
+        return list(targets)
 
     async def route_send(request: web.Request) -> web.Response:
         try:
@@ -75,10 +93,10 @@ def make_routes(store, presence, domain: str = "", mesh_relay=None):
         if not chain_ok and offender:
             record_tamper(offender)
             report = build_tamper_report(msg, offender, domain or request.host)
-            peers = _known_peers()
-            if peers:
+            targets = _tamper_report_targets(msg)
+            if targets:
                 import asyncio
-                asyncio.create_task(_broadcast_tamper_report(report, peers, offender))
+                asyncio.create_task(_broadcast_tamper_report(report, targets, offender))
             log.warning(f"tampered message from {offender} — rejected")
             return err("message integrity chain violated", 403)
 
@@ -96,7 +114,6 @@ def make_routes(store, presence, domain: str = "", mesh_relay=None):
         if spam_result["spam"]:
             log.info(f"spam from {msg.get('from','?')} routed to spam inbox: {spam_result['reason']}")
 
-        # Spam is never pushed in realtime — always stored in the spam inbox
         if not spam_result["spam"] and await presence.deliver(msg_clean["to"], {"type": "msg", "msg": msg_clean}):
             delivery = "realtime"
         else:
@@ -234,11 +251,14 @@ def make_routes(store, presence, domain: str = "", mesh_relay=None):
             report = await request.json()
         except Exception:
             return err("invalid json")
-        if not verify_tamper_report(report):
-            return err("invalid tamper report signature", 403)
+        
+        if not validate_tamper_report(report):
+            return err("invalid or fabricated tamper report", 403)
+        
         offender = report.get("offender", "")
         if not offender:
             return err("missing offender")
+        
         strikes = record_tamper(offender)
         log.warning(f"received tamper report from {report.get('reporter','?')}: {offender} now has {strikes} strike(s)")
         return ok({"offender": offender, "strikes": strikes, "quarantined": is_quarantined(offender)})
