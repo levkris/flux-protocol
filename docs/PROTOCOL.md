@@ -1,249 +1,387 @@
-# FLUX Protocol Specification - v1.0.0
+# FLUX Protocol Specification
 
-FLUX (Fast Lightweight Unified eXchange) is a minimal, cryptographically authenticated messaging protocol. It is transport-agnostic, JSON-native, and designed to be simple enough that anyone can implement a client in an afternoon.
+## Versions
+
+| Thing | Value | Notes |
+|---|---|---|
+| Protocol (`v` field) | `1.0` | Wire format version. Only bumps when signing algorithm or required fields change. |
+| Software / API | `2.1.1` | Semver. Returned by `/health` and `/federation/info`. |
+
+### Changelog
+
+#### 2.1.1
+**Security improvements:**
+- **HTTPS by default:** Federation now uses HTTPS for all server-to-server communication. HTTP is only used for localhost or explicit port specifications (development mode).
+- **Tamper report validation:** Servers verify that tamper reports contain actual proof of tampering by checking the integrity chain. This prevents malicious actors from sending fabricated reports to frame innocent servers.
+- **Enhanced quarantine broadcast:** Tamper reports are now sent to all servers in the message's route in addition to mesh peers, enabling faster network-wide detection of malicious relays.
+
+#### 2.1.0
+**Added:**
+- `integrity_chain` envelope field — append-only list of per-hop SHA-256 records.
+- `encrypted`, `content_enc`, `enc_recipients` envelope fields for E2E encryption.
+- Tamper detection, TamperReport broadcast, and server quarantine system.
+- Built-in spam detection (`flux/spam.py`).
+- Endpoints: `POST /integrity/tamper_report`, `GET /integrity/reputation`, `POST /integrity/verify`.
+
+#### 2.0.0
+**Breaking:**
+- Removed `POST /ack`. Messages are never deleted; use `POST /read` or `POST /delete`.
+- WebSocket `ack` removed; replaced by `read` and `delete`.
+
+**Added:**
+- `subject`, `cc`, `bcc`, `tags`, `expires`, `route` envelope fields.
+- Persistent inbox with status tracking.
+- Multiple inboxes per address.
+- Tags with reserved globals `important`, `favorited`.
+- Route metadata, mesh system.
+- CC/BCC fan-out with BCC stripping.
+
+#### 1.0.0
+Initial release.
 
 ---
 
 ## Core Design Principles
 
-- **Identity is a keypair, not a credential.** No usernames, no passwords, no registration. Your address is derived from your public key.
-- **Every message is signed.** Spoofing an address is cryptographically impossible.
-- **Content is content.** The body of a message is a plain UTF-8 string. No MIME types, no HTML, no embedded metadata.
-- **Transport is pluggable.** HTTP and WebSocket are first-class. Both use the same message envelope.
-- **Minimal envelope.** Only the fields that are strictly necessary exist.
-- **Messages are never destroyed.** Deletion is a status change, not a physical removal. The server retains all messages permanently.
+- **Identity is a keypair.** No usernames, no passwords. Address derived from public key.
+- **Every message is signed.** Spoofing is cryptographically impossible.
+- **Every hop is hashed.** Tampering by intermediate servers is detectable.
+- **Tamper = quarantine.** Servers that tamper with messages are automatically ejected.
+- **Messages are never destroyed.** Deletion is a status change.
+- **Content is content.** Plain UTF-8. No MIME types.
+- **Encryption is first-class.** E2E encryption is built in, not bolted on.
+- **Federation over HTTPS.** Server-to-server communication uses HTTPS by default.
 
 ---
 
 ## Addresses
 
-A FLUX address is derived from an Ed25519 public key:
-
 ```
 address = "fx1" + SHA-256(public_key_bytes)[0:40 hex chars]
 ```
-
-Example: `fx1a84eb946ce36ddf459fcd550663cb7e2bb38f`
-
-Addresses are self-certifying. Possession of the private key proves ownership. No central authority is involved.
 
 ---
 
 ## Message Envelope
 
-Every FLUX message is a JSON object with the following fields:
+### Sender fields (always present)
 
-| Field     | Type    | Required | Description                                      |
-|-----------|---------|----------|--------------------------------------------------|
-| `v`       | string  | yes      | Protocol version. Must be `"1.0"`               |
-| `id`      | string  | yes      | Unique message ID (UUID hex, no hyphens)        |
-| `from`    | string  | yes      | Sender FLUX address                              |
-| `to`      | string  | yes      | Recipient FLUX address                           |
-| `t`       | integer | yes      | Unix timestamp in milliseconds                   |
-| `content` | string  | yes      | Message body. Plain UTF-8, max 65,536 bytes     |
-| `sig`     | string  | yes      | Ed25519 signature (base64url) over core fields  |
-| `pub`     | string  | yes      | Sender public key bytes (base64url)             |
-| `re`      | string  | no       | Message ID this is a reply to                   |
+| Field          | Type        | Required | Description |
+|----------------|-------------|----------|-------------|
+| `v`            | string      | yes      | Protocol version. Must be `"1.0"` |
+| `id`           | string      | yes      | UUID hex, no hyphens |
+| `from`         | string      | yes      | Sender FLUX address |
+| `to`           | string      | yes      | Recipient FLUX address |
+| `t`            | integer     | yes      | Unix timestamp in milliseconds |
+| `content`      | string      | yes      | Message body. Plain UTF-8, max 65,536 bytes. Set to `"[encrypted]"` when E2E encrypted. |
+| `sig`          | string      | yes      | Ed25519 signature (base64url) |
+| `pub`          | string      | yes      | Sender public key (base64url) |
+| `subject`      | string      | no       | Human-readable subject line |
+| `re`           | string      | no       | Message ID this replies to |
+| `cc`           | string[]    | no       | CC recipient FLUX addresses |
+| `bcc`          | string[]    | no       | BCC recipients — stripped before delivery |
+| `tags`         | string[]    | no       | Lowercase tags. Reserved: `important`, `favorited` |
+| `expires`      | integer\|0  | no       | Soft-delete after first read if present. `0` = expire on any read. |
 
-When messages are returned from the server (inbox, fetch), an additional field is present:
+### Server-appended fields (excluded from sender signature)
 
-| Field     | Type   | Description                                      |
-|-----------|--------|--------------------------------------------------|
-| `_status` | string | Server-assigned status: `pending`, `delivered`, `read`, or `deleted` |
+| Field             | Type      | Description |
+|-------------------|-----------|-------------|
+| `route`           | object[]  | `[{server, t}, …]` — each server appends itself on receipt |
+| `integrity_chain` | object[]  | `[HopRecord, …]` — see below |
 
-### Signing
+### E2E encryption fields (set by sender)
 
-The signature is computed over the **core fields only** (`v`, `id`, `from`, `to`, `t`, `content`, and `re` if present). The `sig`, `pub`, and `_status` fields are excluded from the signed payload.
+| Field            | Type              | Description |
+|------------------|-------------------|-------------|
+| `encrypted`      | bool              | `true` when content is E2E encrypted |
+| `content_enc`    | string            | base64url(nonce + ciphertext + GCM tag) |
+| `enc_recipients` | dict[fx1, string] | Per-recipient encrypted CEK blob (base64url) |
+
+### Server-added retrieval metadata (never signed)
+
+| Field     | Type     | Description |
+|-----------|----------|-------------|
+| `_status` | string   | `pending`, `delivered`, `read`, `deleted` |
+| `_inbox`  | string   | Inbox this message lives in |
+| `_tags`   | string[] | Current tags (may differ from envelope if modified server-side) |
+
+---
+
+## Signing
+
+Excluded from signature: `sig`, `pub`, `route`, `integrity_chain`, `_status`, `_inbox`, `_tags`.
 
 ```
-core = {v, id, from, to, t, content [, re]}
+core    = all fields except excluded set above
 payload = JSON.stringify(core, keys_sorted, no_spaces)
-sig = Ed25519Sign(private_key, payload.encode("utf-8"))
+sig     = Ed25519Sign(private_key, payload.encode("utf-8"))
 ```
 
 ### Verification
 
-A receiving node must:
+1. Decode `pub` from base64url.
+2. Confirm `"fx1" + SHA-256(pub_bytes)[0:40]` matches `from`.
+3. Reconstruct canonical payload and verify `sig`.
+4. Reject if `abs(now_ms - t) > 300_000` (5 min clock skew).
 
-1. Decode `pub` from base64url to get the raw public key bytes.
-2. Recompute `"fx1" + SHA-256(pub_bytes)[0:40]` and confirm it matches `from`.
-3. Reconstruct the canonical payload and verify `sig` against it.
-4. Reject messages where `abs(now_ms - t) > 300_000` (5 minute clock skew tolerance).
+---
 
-If any check fails, the message is rejected with a `403`.
+## Integrity Chain
+
+### HopRecord
+
+Each server that receives a message appends a HopRecord to `integrity_chain`:
+
+| Field    | Type   | Description |
+|----------|--------|-------------|
+| `server` | string | Server domain |
+| `t`      | int    | Unix ms when message was received |
+| `hash`   | string | SHA-256(canonical_payload) hex |
+| `sig`    | string | Ed25519 signature of `"server:t:hash"` (base64url) |
+| `pub`    | string | Server's Ed25519 public key (base64url) |
+
+### Canonical payload for hashing
+
+Same as sender signing payload: all fields excluding `sig`, `pub`, `route`, `integrity_chain`, server metadata.
+
+### Chain verification
+
+To verify the chain:
+
+1. Compute the **baseline hash** from the message with an empty `integrity_chain`.
+2. For each HopRecord in order:
+   a. Verify the hop's `sig` against `server:t:hash` using the hop's `pub`.
+   b. Confirm `hash` equals the baseline hash.
+   c. The baseline hash does not change between hops — any alteration of the protected fields would produce a different hash.
+3. If any hop fails either check, identify the offending server and emit a TamperReport.
+
+### TamperReport
+
+When tampering is detected, a signed report is broadcast to:
+- All known mesh peers
+- All servers that appear in the message's route
+- **Excludes the offending server itself**
+
+```json
+{
+  "type": "tamper_report",
+  "msg_id": "<id>",
+  "offender": "relay-x.example.com",
+  "reporter": "server-a.example.com",
+  "t": 1741443200000,
+  "sig": "<Ed25519 sig of tamper:msg_id:offender:reporter:t>",
+  "pub": "<reporter's server pub key>",
+  "integrity_chain": [...],
+  "msg_hash_baseline": "<hex>"
+}
+```
+
+Each server that receives a TamperReport:
+1. **Validates the report** by verifying the integrity chain contains proof of actual tampering by the claimed offender.
+2. Verifies the report's signature.
+3. Records a strike against the offender.
+4. Quarantines the offender when strikes reach `TRUST_THRESHOLD` (default 3).
+5. Rejects any future message that passed through a quarantined server.
+
+**Anti-fraud protection:** The validation step prevents malicious actors from sending fabricated reports to frame innocent servers. A server will only record a strike if the integrity chain proves the offender actually tampered with the message.
+
+---
+
+## End-to-End Encryption
+
+### Encryption scheme
+
+```
+CEK  = random 256-bit key
+nonce = random 96-bit nonce
+content_enc = nonce ‖ AES-256-GCM(CEK, content)
+
+For each recipient (fx1_addr, ed25519_pub):
+  x25519_pub    = birational_map(ed25519_pub)   // Ed25519 → X25519
+  eph_priv      = random X25519 private key
+  eph_pub       = eph_priv.public_key()
+  shared        = X25519(eph_priv, x25519_pub)
+  wrap_key      = SHA-256(shared)
+  enc_cek_blob  = eph_pub ‖ nonce_w ‖ AES-256-GCM(wrap_key, CEK)
+  enc_recipients[fx1_addr] = base64url(enc_cek_blob)
+```
+
+### Decryption
+
+```
+enc_cek_blob  = base64url_decode(enc_recipients[my_fx1_addr])
+eph_pub_bytes = enc_cek_blob[:32]
+wrapped_cek   = enc_cek_blob[32:]
+shared        = X25519(my_x25519_priv, eph_pub_bytes)
+wrap_key      = SHA-256(shared)
+CEK           = AES-256-GCM-decrypt(wrap_key, wrapped_cek)
+content       = AES-256-GCM-decrypt(CEK, base64url_decode(content_enc))
+```
+
+The server never has access to `CEK` or the private keys — decryption is always done client-side.
+
+---
+
+## Spam Detection
+
+Before a message is stored, the server runs heuristic spam checks:
+
+| Check | Description |
+|---|---|
+| Rate limit | Max 20 messages/minute per sender address |
+| Empty content | Reject if content is blank |
+| Repetition | Reject if >85% of content is a single character |
+| URL density | Reject if >5 URLs per 200 characters |
+| Keyword score | Weighted bag-of-words; reject if score ≥ 4 |
+| Subject abuse | All-caps or excessive punctuation in subject |
+
+Spam is rejected with HTTP 451 before storage.
 
 ---
 
 ## Message Lifecycle
 
-Messages move through the following statuses. **They are never physically deleted.**
-
 ```
-  [sent by sender]
-        │
-        ▼
-    pending        — stored, not yet fetched by recipient
-        │
-        ▼ (fetch or WebSocket drain)
-    delivered      — fetched/pushed, not yet read
-        │
-        ▼ (POST /read or WS read action)
-      read         — recipient has marked as read
-        │
-        ▼ (POST /delete or WS delete action)
-    deleted        — soft-deleted; hidden from default inbox view
-                     but permanently retained on the server
+  enqueued
+      │
+      ▼
+  pending       — stored, not yet fetched
+      │
+      ▼  fetch / WS drain
+  delivered     — fetched or pushed, not yet read
+      │
+      ▼  POST /read  or  WS { action: "read" }
+    read         — explicitly marked read
+      │             if `expires` set → goes to deleted
+      ▼  POST /delete  or  WS { action: "delete" }
+  deleted        — soft-deleted; hidden; permanently retained
 ```
-
-Only the recipient can transition a message to `read` or `deleted`. These operations require the recipient's authentication token.
 
 ---
 
-## HTTP Transport
+## CC / BCC
 
-All responses are JSON. Successful responses include `"ok": true`. Errors include `"ok": false` and an `"error"` string.
+- **CC**: recipient gets a copy with the full `cc` list intact.
+- **BCC**: each BCC recipient gets a separate individually addressed copy. The `bcc` field is stripped entirely before delivery.
+
+---
+
+## HTTP Endpoints
+
+All responses: `{"ok": true, …}` on success, `{"ok": false, "error": "…"}` on failure.
 
 ### POST /send
+Submit a signed message. Runs spam check, verifies integrity chain, appends hop record, appends route.
 
-Submit a message to the node.
-
-**Request body:** A complete FLUX message envelope (see above).
-
-**Response:**
-```json
-{ "ok": true, "delivery": "realtime" }
-{ "ok": true, "delivery": "queued" }
-{ "ok": false, "error": "invalid signature" }
-```
-
-`delivery` is `"realtime"` if the recipient was connected via WebSocket and received the message immediately, or `"queued"` if it was stored for later retrieval.
+Response: `{ "ok": true, "delivery": "realtime"|"queued", "mesh": {…} }`
 
 ---
 
 ### GET /fetch/{address}
-
-Drain all **pending** messages for an address, marking them `delivered`.
-Messages are not deleted — they remain on the server with status `delivered`.
-
-**Headers:** `X-Flux-Token: <token>`
-
-**Response:**
-```json
-{ "ok": true, "messages": [ ... ], "count": 2 }
-```
+Drain pending → `delivered`. Supports `?inbox=`.
+Headers: `X-Flux-Token`
 
 ---
 
 ### GET /inbox/{address}
+Return all non-deleted messages. Supports `?inbox=`, `?status=`, `?tag=`.
+Headers: `X-Flux-Token`
 
-Return all messages for an address without consuming them.
-By default, excludes `deleted` messages.
+---
 
-**Headers:** `X-Flux-Token: <token>`
-
-**Query params:**
-- `?status=pending` — only pending messages
-- `?status=delivered` — only delivered messages
-- `?status=read` — only read messages
-- `?status=deleted` — only deleted messages
-- (no param) — all non-deleted messages
-
-**Response:**
-```json
-{ "ok": true, "messages": [ ... ], "count": 5 }
-```
-
-Each message includes a `_status` field.
+### GET /inboxes/{address}
+List all inbox names.
+Headers: `X-Flux-Token`
 
 ---
 
 ### GET /peek/{address}
-
-Check how many **pending** messages are waiting without consuming them.
-
-**Headers:** `X-Flux-Token: <token>`
-
-**Response:**
-```json
-{ "ok": true, "count": 5 }
-```
+Count pending messages.
+Headers: `X-Flux-Token`
 
 ---
 
 ### POST /read
-
-Mark a message as read. Only the recipient may call this.
-
-**Headers:** `X-Flux-Token: <token>`
-
-**Request body:**
+Mark as read. If `expires` is set, soft-deletes instead.
 ```json
-{ "id": "<message_id>", "address": "<recipient_flux_address>" }
+{ "id": "<msg_id>", "address": "<fx1_address>" }
 ```
-
-**Response:**
-```json
-{ "ok": true, "read": true }
-```
+Headers: `X-Flux-Token`
 
 ---
 
 ### POST /delete
-
-Soft-delete a message. Only the recipient may call this.
-The message is retained on the server permanently with status `deleted`.
-It will no longer appear in the default inbox view.
-
-**Headers:** `X-Flux-Token: <token>`
-
-**Request body:**
+Soft-delete.
 ```json
-{ "id": "<message_id>", "address": "<recipient_flux_address>" }
+{ "id": "<msg_id>", "address": "<fx1_address>" }
 ```
+Headers: `X-Flux-Token`
 
-**Response:**
+---
+
+### POST /tag
+Add or remove a tag.
 ```json
-{ "ok": true, "deleted": true }
+{ "id": "<msg_id>", "address": "<fx1_address>", "tag": "important", "action": "add"|"remove" }
 ```
+Headers: `X-Flux-Token`
+
+---
+
+### POST /move
+Move to a different inbox.
+```json
+{ "id": "<msg_id>", "address": "<fx1_address>", "inbox": "archive" }
+```
+Headers: `X-Flux-Token`
 
 ---
 
 ### GET /status/{address}
-
-Check whether an address currently has an active WebSocket connection.
-
-**Response:**
-```json
-{ "ok": true, "address": "fx1...", "online": true }
-```
+Check if address has an active WebSocket connection.
 
 ---
 
 ### GET /stats
-
 Server-wide statistics.
 
-**Response:**
+---
+
+### GET /health
+```json
+{ "ok": true, "protocol": "1.0", "version": "2.1.1" }
+```
+
+---
+
+### POST /integrity/tamper_report
+Receive a tamper report from a peer. Validates the integrity chain to confirm actual tampering, verifies signature, records strike, quarantines if threshold reached.
+
+---
+
+### GET /integrity/reputation
 ```json
 {
   "ok": true,
-  "backend": "sqlite",
-  "total": 42,
-  "pending": 3,
-  "delivered": 5,
-  "read": 31,
-  "deleted": 3,
-  "addresses": 4,
-  "online_addresses": 1,
-  "ws_connections": 2
+  "strikes": {"relay-x.example.com": 3},
+  "quarantined": ["relay-x.example.com"]
 }
 ```
 
 ---
 
-### GET /health
-
-Liveness check. Returns `200` if the server is running.
+### POST /integrity/verify
+Verify a message's sender signature and full integrity chain.
+```json
+{
+  "ok": true,
+  "signature_valid": true,
+  "integrity_chain_valid": true,
+  "offending_server": null,
+  "hop_count": 2
+}
+```
 
 ---
 
@@ -251,122 +389,39 @@ Liveness check. Returns `200` if the server is running.
 
 Connect to `ws://<host>:<port>/ws`. All frames are JSON text.
 
-### Authentication
-
-The first frame sent by the client must be an auth frame:
-
+### Auth (first frame)
 ```json
-{ "action": "auth", "address": "fx1...", "token": "<token>" }
+{ "action": "auth", "address": "fx1…", "token": "<token>", "inbox": "inbox" }
 ```
-
-On success, the server drains any pending messages (marking them `delivered`) and responds with the full inbox:
-
-```json
-{
-  "ok": true,
-  "action": "authed",
-  "address": "fx1...",
-  "messages": [ ... ]
-}
-```
-
-Each message in `messages` includes a `_status` field.
-
----
-
-### Sending via WebSocket
-
-```json
-{ "action": "send", "msg": { <full message envelope> } }
-```
-
 Response:
 ```json
-{ "ok": true, "id": "<msg_id>", "delivery": "realtime" }
+{ "ok": true, "action": "authed", "address": "…", "inbox": "inbox", "messages": […] }
 ```
 
----
+### Actions
 
-### Receiving messages
-
-Inbound messages are pushed as:
-
-```json
-{ "type": "msg", "msg": { <full message envelope> } }
-```
-
----
-
-### Marking a message as read via WebSocket
-
-```json
-{ "action": "read", "id": "<msg_id>" }
-```
-
-Response:
-```json
-{ "ok": true, "read": true }
-```
-
-The address is taken from the authenticated session — only the connected user's messages can be marked.
-
----
-
-### Soft-deleting a message via WebSocket
-
-```json
-{ "action": "delete", "id": "<msg_id>" }
-```
-
-Response:
-```json
-{ "ok": true, "deleted": true }
-```
-
----
-
-### Ping / Pong
-
-```json
-{ "action": "ping" }
-```
-```json
-{ "ok": true, "action": "pong", "t": 1741443200000 }
-```
+| Action   | Extra fields | Description |
+|----------|-------------|-------------|
+| `send`   | `msg: {…}`  | Send a message (spam + integrity checked) |
+| `read`   | `id`        | Mark as read |
+| `delete` | `id`        | Soft-delete |
+| `tag`    | `id`, `tag`, `tag_action: "add"\|"remove"` | Tag a message |
+| `move`   | `id`, `inbox` | Move to inbox |
+| `ping`   | —           | Heartbeat |
 
 ---
 
 ## Authentication Token
 
-Fetch, peek, inbox, read, and delete operations require an `X-Flux-Token` header. The token is derived as:
-
 ```
 token = SHA-256("flux:" + address + ":" + FLUX_SECRET)
 ```
 
-`FLUX_SECRET` is a shared secret set on the server via environment variable. Clients who know their own private key and the server secret can compute their token locally — no login round-trip needed.
-
-> **Production note:** Replace this with a challenge-response scheme (sign a server-issued nonce with your private key) for deployments where the server secret cannot be shared with clients.
-
 ---
 
-## Full Message Lifecycle Diagram
+## Mesh System
 
-```
-Client A                   FLUX Node                  Client B
-   │                           │                           │
-   │── POST /send ────────────▶│                           │
-   │                           │── WebSocket push ────────▶│  (if online)
-   │◀── { delivery: realtime } │                           │
-   │                           │                           │
-   │                           │  (B offline: pending)     │
-   │                           │                           │
-   │                           │◀── WS connect + auth ─────│
-   │                           │─── inbox flush ──────────▶│  (pending→delivered)
-   │                           │                           │
-   │                           │◀── { action: read } ──────│  (delivered→read)
-   │                           │◀── { action: delete } ────│  (read→deleted, retained)
-```
+See `mesh.config.example.json` and the main README for full details. Tamper reports are automatically forwarded to mesh peers and all servers in the message's route.
 
 ---
 
@@ -378,18 +433,7 @@ Client A                   FLUX Node                  Client B
 | Max queued per address | 500        |
 | Clock skew tolerance   | 5 minutes  |
 | WS heartbeat interval  | 20 seconds |
+| Spam rate limit        | 20 msg/min |
+| Tamper strikes → quarantine | 3     |
 
-All limits are configurable in `flux/constants.py`.
-
----
-
-## Extending FLUX
-
-The protocol is intentionally minimal. Common extensions:
-
-- **Encryption:** Encrypt `content` with the recipient's public key before sending. The node never sees plaintext.
-- **Attachments:** Store blobs out-of-band, put the URL or hash in `content`.
-- **Threading:** Use the `re` field to chain messages into threads.
-- **Federation:** Nodes can forward messages to other nodes based on address prefix routing.
-- **Groups:** A group is just an address. The holder of the private key distributes to members.
-- **Archiving:** Query `?status=deleted` to implement a trash/archive view.
+All configurable in `flux/constants.py`.

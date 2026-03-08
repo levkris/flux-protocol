@@ -1,0 +1,33 @@
+{
+  "_comment": "FLUX Mesh Configuration. Copy to mesh.config.json and edit.",
+  "meshes": {
+    "main": {
+      "_comment": "Broadcast: every message goes to ALL peers. Best for redundancy.",
+      "token": "change-me-shared-secret-all-servers-must-match",
+      "mode": "broadcast",
+      "peers": [
+        "http://server-a.example.com:8765",
+        "http://server-b.example.com:8765"
+      ]
+    },
+    "eu-chain": {
+      "_comment": "Chain: message passes through peers in order, stops on first success.",
+      "token": "different-secret-per-mesh",
+      "mode": "chain",
+      "peers": [
+        "http://eu-1.example.com:8765",
+        "http://eu-2.example.com:8765",
+        "http://eu-3.example.com:8765"
+      ]
+    },
+    "hybrid-us": {
+      "_comment": "Hybrid: sends to peer where recipient is online, falls back to broadcast.",
+      "token": "yet-another-secret",
+      "mode": "hybrid",
+      "peers": [
+        "http://us-east.example.com:8765",
+        "http://us-west.example.com:8765"
+      ]
+    }
+  }
+}

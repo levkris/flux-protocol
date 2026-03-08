@@ -5,14 +5,56 @@ import aiohttp
 from aiohttp import web
 
 from .auth import validate_token
-from .constants import FLUX_VERSION, WS_PING_INTERVAL
-from .message import validate_fields, verify_message, check_freshness, now_ms
+from .constants import FLUX_VERSION, WS_PING_INTERVAL, DEFAULT_INBOX
+from .message import validate_fields, verify_message, check_freshness, now_ms, append_route, strip_bcc
+from .integrity import (
+    append_integrity_hop, verify_integrity_chain,
+    record_tamper, is_quarantined, build_tamper_report,
+)
+from .spam import is_spam
 
 log = logging.getLogger("flux.ws")
 
 
-def make_ws_handler(store, presence):
-    """Return a WebSocket handler bound to a store and presence registry."""
+def _server_to_url(server: str) -> str:
+    """Convert a server domain to a full URL (HTTPS by default, HTTP for localhost/ports)."""
+    if server.startswith("http"):
+        return server.rstrip("/")
+    scheme = "http" if ("localhost" in server.lower() or ":" in server) else "https"
+    return f"{scheme}://{server}"
+
+
+def make_ws_handler(store, presence, domain: str = "", mesh_relay=None):
+
+    def _known_peers() -> list[str]:
+        if not mesh_relay:
+            return []
+        peers = []
+        for cfg in mesh_relay._meshes.values():
+            peers.extend(cfg.get("peers", []))
+        return list(set(peers))
+
+    def _tamper_report_targets(msg: dict) -> list[str]:
+        """Get broadcast targets: mesh peers + all servers in message route."""
+        targets = set(_known_peers())
+        for hop in msg.get("route", []):
+            server = hop.get("server", "")
+            if server:
+                targets.add(_server_to_url(server))
+        return list(targets)
+
+    async def _broadcast_tamper(report: dict, targets: list[str], offender: str):
+        import asyncio
+        import aiohttp as _aio
+        async with _aio.ClientSession() as session:
+            for target in targets:
+                if offender.lower() in target.lower():
+                    continue
+                try:
+                    await session.post(f"{target}/integrity/tamper_report", json=report,
+                                       timeout=_aio.ClientTimeout(total=5))
+                except Exception:
+                    pass
 
     async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=WS_PING_INTERVAL)
@@ -35,90 +77,127 @@ def make_ws_handler(store, presence):
                     if action == "auth":
                         addr = frame.get("address", "")
                         token = frame.get("token", "")
-
                         if not validate_token(addr, token):
                             await ws.send_str(json.dumps({"ok": False, "error": "unauthorized"}))
                             continue
-
                         address = addr
                         authed = True
                         await presence.register(address, ws)
-
-                        # Drain pending messages on connect (marks them delivered)
-                        # then return the full inbox so the client has everything
-                        await store.drain(address)
-                        inbox = await store.list_messages(address)
+                        inbox = frame.get("inbox", DEFAULT_INBOX)
+                        await store.drain(address, inbox)
+                        messages = await store.list_messages(address, inbox)
                         await ws.send_str(json.dumps({
-                            "ok": True,
-                            "action": "authed",
-                            "address": address,
-                            "messages": inbox,
+                            "ok": True, "action": "authed", "address": address,
+                            "inbox": inbox, "messages": messages,
                         }))
-                        log.info(f"authed {address} ({len(inbox)} messages in inbox)")
+                        log.info(f"authed {address} ({len(messages)} messages in inbox)")
 
                     elif action == "send":
                         if not authed:
                             await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
                             continue
-
                         msg = frame.get("msg", {})
-
                         if not validate_fields(msg):
                             await ws.send_str(json.dumps({"ok": False, "error": "missing fields"}))
                             continue
-
                         if msg.get("v") != FLUX_VERSION:
                             await ws.send_str(json.dumps({"ok": False, "error": "unsupported version"}))
                             continue
-
                         if not check_freshness(msg):
                             await ws.send_str(json.dumps({"ok": False, "error": "clock skew"}))
                             continue
-
                         if not verify_message(msg):
                             await ws.send_str(json.dumps({"ok": False, "error": "invalid signature"}))
                             continue
 
-                        if await presence.deliver(msg["to"], {"type": "msg", "msg": msg}):
+                        spam_result = is_spam(msg)
+
+                        chain_ok, offender = verify_integrity_chain(msg)
+                        if not chain_ok and offender:
+                            record_tamper(offender)
+                            report = build_tamper_report(msg, offender, domain or request.host)
+                            targets = _tamper_report_targets(msg)
+                            if targets:
+                                import asyncio
+                                asyncio.create_task(_broadcast_tamper(report, targets, offender))
+                            await ws.send_str(json.dumps({"ok": False, "error": "integrity chain violated"}))
+                            continue
+
+                        if any(is_quarantined(h.get("server", "")) for h in (msg.get("integrity_chain") or [])):
+                            await ws.send_str(json.dumps({"ok": False, "error": "message from quarantined server"}))
+                            continue
+
+                        hop = domain or request.host
+                        msg = append_integrity_hop(append_route(msg, hop), hop)
+                        msg_clean = strip_bcc(msg)
+
+                        inbox = "spam" if spam_result["spam"] else DEFAULT_INBOX
+
+                        if not spam_result["spam"] and await presence.deliver(msg_clean["to"], {"type": "msg", "msg": msg_clean}):
                             delivery = "realtime"
                             result = True
                         else:
-                            result = await store.enqueue(msg)
+                            result = await store.enqueue(msg_clean, inbox=inbox)
                             delivery = "queued" if result else "dropped"
 
+                        mesh_results = {}
+                        if mesh_relay:
+                            mesh_results = await mesh_relay.relay(msg_clean)
+
                         await ws.send_str(json.dumps({
-                            "ok": result,
-                            "id": msg["id"],
-                            "delivery": delivery,
+                            "ok": result, "id": msg_clean["id"],
+                            "delivery": delivery, "mesh": mesh_results,
                         }))
 
                     elif action == "read":
-                        # Mark a message as read - only the authenticated user's messages
                         if not authed:
                             await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
                             continue
-
                         msg_id = frame.get("id", "")
                         if not msg_id:
                             await ws.send_str(json.dumps({"ok": False, "error": "missing id"}))
                             continue
-
                         found = await store.mark_read(msg_id, address)
                         await ws.send_str(json.dumps({"ok": True, "read": found}))
 
                     elif action == "delete":
-                        # Soft-delete a message - only the authenticated user's messages
                         if not authed:
                             await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
                             continue
-
                         msg_id = frame.get("id", "")
                         if not msg_id:
                             await ws.send_str(json.dumps({"ok": False, "error": "missing id"}))
                             continue
-
                         found = await store.delete_message(msg_id, address)
                         await ws.send_str(json.dumps({"ok": True, "deleted": found}))
+
+                    elif action == "tag":
+                        if not authed:
+                            await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
+                            continue
+                        msg_id = frame.get("id", "")
+                        tag = frame.get("tag", "").strip().lower()
+                        tag_action = frame.get("tag_action", "add")
+                        if not msg_id or not tag:
+                            await ws.send_str(json.dumps({"ok": False, "error": "missing id or tag"}))
+                            continue
+                        if tag_action == "add":
+                            found = await store.add_tag(msg_id, address, tag)
+                        else:
+                            found = await store.remove_tag(msg_id, address, tag)
+                        await ws.send_str(json.dumps({"ok": True, "tag": tag, "tag_action": tag_action, "applied": found}))
+
+                    elif action == "move":
+                        if not authed:
+                            await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
+                            continue
+                        msg_id = frame.get("id", "")
+                        inbox = frame.get("inbox", "").strip()
+                        if not msg_id or not inbox:
+                            await ws.send_str(json.dumps({"ok": False, "error": "missing id or inbox"}))
+                            continue
+                        found = await store.move_inbox(msg_id, address, inbox)
+                        await ws.send_str(json.dumps({"ok": True, "moved": found, "inbox": inbox}))
 
                     elif action == "ping":
                         await ws.send_str(json.dumps({"ok": True, "action": "pong", "t": now_ms()}))
