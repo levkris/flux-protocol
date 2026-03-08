@@ -1,5 +1,8 @@
 FLUX_VERSION = "1.0"
 
+# API version
+FLUX_API_VERSION = "2.0.0"
+
 # Maximum size of the content field in bytes
 MAX_CONTENT_BYTES = 65_536
 
