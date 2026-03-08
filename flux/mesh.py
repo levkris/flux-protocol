@@ -1,45 +1,19 @@
-"""
-FLUX Mesh System
-================
-
-A mesh connects multiple FLUX servers into a unified delivery network.
-All servers in a mesh share a mesh_token. Three delivery modes:
-
-  broadcast — message sent to ALL peers simultaneously (redundancy/archiving)
-  chain     — message passes through peers one at a time; stops on first success
-  hybrid    — routes to the peer where the recipient is online; falls back to broadcast
-
-mesh.config.json structure:
-{
-  "meshes": {
-    "mesh-name": {
-      "token": "shared-secret",
-      "mode": "broadcast" | "chain" | "hybrid",
-      "peers": ["http://server-a:8765", "http://server-b:8765"]
-    }
-  }
-}
-
-Multiple meshes can be active simultaneously.
-"""
-
 import asyncio
 import hashlib
 import hmac
 import json
 import logging
-from pathlib import Path
 from typing import Optional
 
 import aiohttp
 
+from .constants import MESH_HEADER, MESH_CONFIG_PATH
+
 log = logging.getLogger("flux.mesh")
 
-MESH_HEADER = "X-Flux-Mesh-Token"
-MESH_CONFIG_PATH = Path("mesh.config.json")
 
-
-def load_mesh_config(path: str | Path = MESH_CONFIG_PATH) -> dict:
+def load_mesh_config(path=MESH_CONFIG_PATH) -> dict:
+    from pathlib import Path
     p = Path(path)
     if not p.exists():
         return {}
@@ -58,7 +32,6 @@ def _derive(token: str) -> str:
 
 
 def validate_mesh_token(raw: str, meshes: dict) -> Optional[str]:
-    """Return mesh name if token matches any configured mesh, else None."""
     d = _derive(raw)
     for name, cfg in meshes.items():
         if hmac.compare_digest(d, _derive(cfg["token"])):
@@ -73,7 +46,6 @@ class MeshRelay:
         self._local = local_url.rstrip("/")
 
     async def relay(self, msg: dict, source_mesh: Optional[str] = None) -> dict[str, str]:
-        """Relay msg to all relevant mesh peers. Returns {peer_url: result}."""
         results: dict[str, str] = {}
         names = [source_mesh] if source_mesh else list(self._meshes.keys())
 
@@ -146,6 +118,7 @@ class MeshRelay:
 def make_mesh_routes(store, presence, meshes: dict):
     from aiohttp import web
     from .message import validate_fields, check_freshness, verify_message, append_route, strip_bcc
+    from .integrity import append_integrity_hop
 
     async def route_relay(request: web.Request) -> web.Response:
         token_header = request.headers.get(MESH_HEADER, "")
@@ -175,6 +148,7 @@ def make_mesh_routes(store, presence, meshes: dict):
 
         domain = request.app.get("domain", request.host)
         msg = append_route(msg, domain)
+        msg = append_integrity_hop(msg, domain)
         msg = strip_bcc(msg)
 
         if await presence.deliver(msg["to"], {"type": "msg", "msg": msg}):

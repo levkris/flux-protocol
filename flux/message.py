@@ -3,23 +3,14 @@ import time
 import uuid
 from typing import Optional
 
-from .constants import FLUX_VERSION, MAX_CONTENT_BYTES, MAX_MESSAGE_AGE_MS
+from .constants import FLUX_VERSION, MAX_CONTENT_BYTES, MAX_MESSAGE_AGE_MS, TAG_IMPORTANT, TAG_FAVORITED, RESERVED_TAGS
 from .crypto import b64d, pub_to_address, verify
 from .identity import FluxIdentity
 
-TAG_IMPORTANT = "important"
-TAG_FAVORITED = "favorited"
-RESERVED_TAGS = {TAG_IMPORTANT, TAG_FAVORITED}
-
-
 def now_ms() -> int:
     return int(time.time() * 1000)
-
-
 def make_id() -> str:
     return uuid.uuid4().hex
-
-
 def build_message(
     identity: FluxIdentity,
     to: str,
@@ -31,7 +22,6 @@ def build_message(
     tags: Optional[list[str]] = None,
     expires: Optional[int] = None,
 ) -> dict:
-    """Construct and sign a FLUX message envelope."""
     if len(content.encode()) > MAX_CONTENT_BYTES:
         raise ValueError(f"Content exceeds {MAX_CONTENT_BYTES} bytes")
 
@@ -57,36 +47,25 @@ def build_message(
     if expires is not None:
         envelope["expires"] = expires
 
-    # Route metadata — servers append themselves as the message passes through
+    # route and integrity_chain are appended by servers and excluded from the sender's signature
     envelope["route"] = []
+    envelope["integrity_chain"] = []
 
-    # Sign only the core fields (route, pub, sig, and server meta excluded)
     core = _core_fields(envelope)
     payload = json.dumps(core, separators=(",", ":"), sort_keys=True)
     envelope["sig"] = identity.sign(payload)
     envelope["pub"] = identity.pub_b64()
 
     return envelope
-
-
 def _core_fields(msg: dict) -> dict:
-    """Fields included in the signature. Route and server metadata are excluded."""
-    EXCLUDE = {"sig", "pub", "route", "_status", "_inbox", "_tags"}
+    EXCLUDE = {"sig", "pub", "route", "integrity_chain", "_status", "_inbox", "_tags"}
     return {k: v for k, v in msg.items() if k not in EXCLUDE}
-
-
 def strip_bcc(msg: dict) -> dict:
-    """Return a copy of the message with BCC removed (for delivery to non-BCC recipients)."""
     return {k: v for k, v in msg.items() if k != "bcc"}
-
-
 def append_route(msg: dict, hop: str) -> dict:
-    """Return a copy of the message with this server appended to the route."""
     m = dict(msg)
     m["route"] = list(msg.get("route") or []) + [{"server": hop, "t": now_ms()}]
     return m
-
-
 def verify_message(msg: dict) -> bool:
     try:
         pub_bytes = b64d(msg["pub"])
@@ -97,21 +76,13 @@ def verify_message(msg: dict) -> bool:
         return verify(pub_bytes, payload, msg["sig"])
     except Exception:
         return False
-
-
 def check_freshness(msg: dict) -> bool:
     return abs(now_ms() - msg.get("t", 0)) <= MAX_MESSAGE_AGE_MS
-
-
 def is_expired(msg: dict) -> bool:
     exp = msg.get("expires")
     if exp is None:
         return False
     return now_ms() >= exp
-
-
 REQUIRED_FIELDS = ("v", "id", "from", "to", "t", "content", "sig", "pub")
-
-
 def validate_fields(msg: dict) -> bool:
     return all(k in msg for k in REQUIRED_FIELDS)
