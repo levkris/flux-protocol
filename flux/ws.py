@@ -44,17 +44,23 @@ def make_ws_handler(store, presence):
                         authed = True
                         await presence.register(address, ws)
 
-                        # Flush any queued messages on connect
-                        pending = await store.drain(address)
+                        # Drain pending messages on connect (marks them delivered)
+                        # then return the full inbox so the client has everything
+                        await store.drain(address)
+                        inbox = await store.list_messages(address)
                         await ws.send_str(json.dumps({
                             "ok": True,
                             "action": "authed",
                             "address": address,
-                            "queued": pending,
+                            "messages": inbox,
                         }))
-                        log.info(f"authed {address} ({len(pending)} queued messages flushed)")
+                        log.info(f"authed {address} ({len(inbox)} messages in inbox)")
 
                     elif action == "send":
+                        if not authed:
+                            await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
+                            continue
+
                         msg = frame.get("msg", {})
 
                         if not validate_fields(msg):
@@ -86,10 +92,33 @@ def make_ws_handler(store, presence):
                             "delivery": delivery,
                         }))
 
-                    elif action == "ack":
+                    elif action == "read":
+                        # Mark a message as read - only the authenticated user's messages
+                        if not authed:
+                            await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
+                            continue
+
                         msg_id = frame.get("id", "")
-                        found = await store.ack(msg_id)
-                        await ws.send_str(json.dumps({"ok": True, "acked": found}))
+                        if not msg_id:
+                            await ws.send_str(json.dumps({"ok": False, "error": "missing id"}))
+                            continue
+
+                        found = await store.mark_read(msg_id, address)
+                        await ws.send_str(json.dumps({"ok": True, "read": found}))
+
+                    elif action == "delete":
+                        # Soft-delete a message - only the authenticated user's messages
+                        if not authed:
+                            await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
+                            continue
+
+                        msg_id = frame.get("id", "")
+                        if not msg_id:
+                            await ws.send_str(json.dumps({"ok": False, "error": "missing id"}))
+                            continue
+
+                        found = await store.delete_message(msg_id, address)
+                        await ws.send_str(json.dumps({"ok": True, "deleted": found}))
 
                     elif action == "ping":
                         await ws.send_str(json.dumps({"ok": True, "action": "pong", "t": now_ms()}))

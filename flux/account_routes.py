@@ -189,14 +189,26 @@ def make_account_routes(domain: str):
             "delivery": delivery,
         })
 
+    # --- Inbox ---
+
     @_require_session
     async def route_fetch_inbox(request: web.Request) -> web.Response:
-        """Fetch and drain messages for the authenticated user."""
+        """
+        Return all messages for the authenticated user.
+        Accepts optional ?status= query param (pending, delivered, read).
+        Messages are never deleted — this is a persistent inbox.
+        Pending messages are marked as delivered when fetched.
+        """
         username = request["username"]
         account = await request.app["accounts"].get_by_username(username)
         fx1_address = account["flux_address"]
 
-        msgs = await request.app["store"].drain(fx1_address)
+        status_filter = request.rel_url.query.get("status")
+
+        # Drain pending → delivered first so the inbox reflects current state
+        await request.app["store"].drain(fx1_address)
+
+        msgs = await request.app["store"].list_messages(fx1_address, status=status_filter)
         return _ok({"messages": msgs, "count": len(msgs)})
 
     @_require_session
@@ -207,6 +219,54 @@ def make_account_routes(domain: str):
 
         count = await request.app["store"].peek_count(fx1_address)
         return _ok({"count": count})
+
+    @_require_session
+    async def route_read_message(request: web.Request) -> web.Response:
+        """
+        Mark a message as read.
+        Only the authenticated recipient can mark their own messages.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _err("invalid json")
+
+        msg_id = body.get("id", "")
+        if not msg_id:
+            return _err("missing 'id'")
+
+        username = request["username"]
+        account = await request.app["accounts"].get_by_username(username)
+        fx1_address = account["flux_address"]
+
+        found = await request.app["store"].mark_read(msg_id, fx1_address)
+        if not found:
+            return _err("message not found or already read", 404)
+        return _ok({"read": True})
+
+    @_require_session
+    async def route_delete_message(request: web.Request) -> web.Response:
+        """
+        Soft-delete a message (marks it as 'deleted', never physically removed).
+        Only the authenticated recipient can delete their own messages.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _err("invalid json")
+
+        msg_id = body.get("id", "")
+        if not msg_id:
+            return _err("missing 'id'")
+
+        username = request["username"]
+        account = await request.app["accounts"].get_by_username(username)
+        fx1_address = account["flux_address"]
+
+        found = await request.app["store"].delete_message(msg_id, fx1_address)
+        if not found:
+            return _err("message not found or already deleted", 404)
+        return _ok({"deleted": True})
 
     # --- Federation endpoint (called by remote servers) ---
 
@@ -239,6 +299,8 @@ def make_account_routes(domain: str):
         web.post("/mail/send", route_federated_send),
         web.get("/mail/inbox", route_fetch_inbox),
         web.get("/mail/peek", route_peek_inbox),
+        web.post("/mail/read", route_read_message),
+        web.post("/mail/delete", route_delete_message),
         web.get("/federation/resolve/{username}", route_federation_resolve),
         web.get("/federation/info", route_federation_info),
     ]

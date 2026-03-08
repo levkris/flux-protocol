@@ -1,6 +1,6 @@
 # FLUX
 
-**Fast Lightweight Unified eXchange** — a minimal, cryptographically authenticated messaging protocol.
+**Fast Lightweight Unified eXchange** - a minimal, cryptographically authenticated messaging protocol.
 
 No usernames. No passwords. No MIME types. No tags. Your identity is a keypair. Your address is derived from your public key. Every message is signed. Content is just content.
 
