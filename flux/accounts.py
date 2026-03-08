@@ -21,7 +21,7 @@ def _hash_password(password: str, salt: str) -> str:
         password.encode(),
         salt=salt.encode(),
         n=16384, r=8, p=1,
-        dklength=32
+        dklen=32
     ).hex()
 
 
