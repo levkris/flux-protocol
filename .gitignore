@@ -34,3 +34,5 @@ identities/
 
 .DS_Store
 Thumbs.db
+
+.flux_session.json

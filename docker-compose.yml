@@ -13,7 +13,7 @@ services:
       - FLUX_DB_PATH=/data/flux.db
       - FLUX_ACCOUNTS_DB=/data/flux_accounts.db
       - FLUX_PORT=8765
-      - FLUX_DOMAIN=mail.example.com
+      - FLUX_DOMAIN=localhost:8765
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')"]
