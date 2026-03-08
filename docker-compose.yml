@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  flux:
+    build: .
+    ports:
+      - "8765:8765"
+    volumes:
+      - flux_data:/data
+    environment:
+      - FLUX_SECRET=change-me-in-production
+      - FLUX_BACKEND=sqlite
+      - FLUX_DB_PATH=/data/flux.db
+      - FLUX_ACCOUNTS_DB=/data/flux_accounts.db
+      - FLUX_PORT=8765
+      - FLUX_DOMAIN=mail.example.com
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  flux_data:
