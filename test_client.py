@@ -7,7 +7,9 @@ Connects via WebSocket by default. Supports the full account system:
   - Login
   - Send mail to user@domain or fx1... addresses
   - Receive mail in real time
-  - Fetch inbox (HTTP fallback)
+  - View persistent inbox (messages are never deleted automatically)
+  - Mark messages as read
+  - Delete messages (soft-delete, server retains them)
 
 Usage:
     python test_client.py                          # connect to localhost:8765
@@ -26,14 +28,25 @@ import aiohttp
 SERVER = "http://localhost:8765"
 SESSION_FILE = ".flux_session.json"
 
+STATUS_ICON = {
+    "pending":   "🔵",
+    "delivered": "📬",
+    "read":      "✅",
+    "deleted":   "🗑️",
+}
+
 
 def ts_to_str(ts_ms: int) -> str:
     dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def print_msg(msg: dict):
+def print_msg(msg: dict, index: int | None = None):
+    status = msg.get("_status", "")
+    icon = STATUS_ICON.get(status, "")
+    prefix = f"[{index}] " if index is not None else ""
     print("\n" + "─" * 60)
+    print(f"  {prefix}{icon} {status.upper()}")
     print(f"  FROM : {msg.get('from', '?')}")
     print(f"  TO   : {msg.get('to', '?')}")
     print(f"  ID   : {msg.get('id', '?')[:16]}…")
@@ -139,24 +152,97 @@ async def send_mail(session: aiohttp.ClientSession, server: str, account: dict):
         print(f"\n  Error: {data.get('error')}")
 
 
-async def fetch_inbox(session: aiohttp.ClientSession, server: str, account: dict):
+async def fetch_inbox(session: aiohttp.ClientSession, server: str, account: dict) -> list[dict]:
+    """Fetch inbox. Returns message list so callers can act on them."""
+    status_filter = input("  Filter by status (pending/delivered/read, or blank for all): ").strip() or None
+
+    params = {}
+    if status_filter:
+        params["status"] = status_filter
+
     async with session.get(
         f"{server}/mail/inbox",
         headers={"X-Flux-Session": account["session"]},
+        params=params,
     ) as r:
         data = await r.json()
 
     if not data.get("ok"):
         print(f"  Error: {data.get('error')}")
-        return
+        return []
 
     msgs = data.get("messages", [])
     if not msgs:
         print("\n  Inbox empty.")
     else:
         print(f"\n  {len(msgs)} message(s):")
-        for msg in msgs:
-            print_msg(msg)
+        for i, msg in enumerate(msgs):
+            print_msg(msg, index=i)
+    return msgs
+
+
+async def read_message(session: aiohttp.ClientSession, server: str, account: dict, msgs: list[dict]):
+    """Mark a message as read by index or ID."""
+    if not msgs:
+        print("  No messages loaded — run 'inbox' first.")
+        return
+
+    choice = input("  Message index or ID to mark read: ").strip()
+    msg_id = _resolve_msg_id(choice, msgs)
+    if not msg_id:
+        print("  Invalid selection.")
+        return
+
+    async with session.post(
+        f"{server}/mail/read",
+        json={"id": msg_id},
+        headers={"X-Flux-Session": account["session"]},
+    ) as r:
+        data = await r.json()
+
+    if data.get("ok"):
+        print(f"  ✅ Marked as read.")
+    else:
+        print(f"  Error: {data.get('error')}")
+
+
+async def delete_message(session: aiohttp.ClientSession, server: str, account: dict, msgs: list[dict]):
+    """Soft-delete a message by index or ID."""
+    if not msgs:
+        print("  No messages loaded — run 'inbox' first.")
+        return
+
+    choice = input("  Message index or ID to delete: ").strip()
+    msg_id = _resolve_msg_id(choice, msgs)
+    if not msg_id:
+        print("  Invalid selection.")
+        return
+
+    async with session.post(
+        f"{server}/mail/delete",
+        json={"id": msg_id},
+        headers={"X-Flux-Session": account["session"]},
+    ) as r:
+        data = await r.json()
+
+    if data.get("ok"):
+        print(f"  🗑️  Message deleted (soft-delete, retained on server).")
+    else:
+        print(f"  Error: {data.get('error')}")
+
+
+def _resolve_msg_id(choice: str, msgs: list[dict]) -> str | None:
+    """Resolve an index or partial ID string to a full message ID."""
+    if choice.isdigit():
+        idx = int(choice)
+        if 0 <= idx < len(msgs):
+            return msgs[idx]["id"]
+        return None
+    # Try partial ID match
+    for msg in msgs:
+        if msg["id"].startswith(choice):
+            return msg["id"]
+    return None
 
 
 async def show_me(session: aiohttp.ClientSession, server: str, account: dict):
@@ -200,10 +286,11 @@ async def ws_loop(server: str, account: dict):
                     frame = json.loads(raw.data)
 
                     if frame.get("action") == "authed":
-                        queued = frame.get("queued", [])
-                        if queued:
-                            print(f"\n  ✉  {len(queued)} queued message(s) delivered:")
-                            for msg in queued:
+                        msgs = frame.get("messages", [])
+                        unread = [m for m in msgs if m.get("_status") in ("pending", "delivered")]
+                        if unread:
+                            print(f"\n  ✉  {len(unread)} unread message(s) in inbox:")
+                            for msg in unread:
                                 print_msg(msg)
                         else:
                             print("  ✓  WebSocket connected. Waiting for messages…")
@@ -223,7 +310,7 @@ async def ws_loop(server: str, account: dict):
 # ── HTTP polling mode ─────────────────────────────────────────────────────────
 
 async def poll_loop(server: str, account: dict, interval: int = 5):
-    """Poll the inbox every `interval` seconds (HTTP fallback)."""
+    """Poll for new (pending) messages every `interval` seconds."""
     async with aiohttp.ClientSession() as session:
         while True:
             await asyncio.sleep(interval)
@@ -231,6 +318,7 @@ async def poll_loop(server: str, account: dict, interval: int = 5):
                 async with session.get(
                     f"{server}/mail/inbox",
                     headers={"X-Flux-Session": account["session"]},
+                    params={"status": "pending"},
                 ) as r:
                     data = await r.json()
                 msgs = data.get("messages", [])
@@ -252,7 +340,9 @@ def print_help(account: dict | None):
         print("    login      — log in to existing account")
     else:
         print(f"    send       — send a message")
-        print(f"    inbox      — fetch inbox (HTTP)")
+        print(f"    inbox      — view inbox (persistent, never deleted)")
+        print(f"    read       — mark a message as read")
+        print(f"    delete     — soft-delete a message")
         print(f"    me         — show your account info")
         print(f"    logout     — log out")
     print("    help       — show this")
@@ -262,6 +352,7 @@ def print_help(account: dict | None):
 async def main_loop(server: str, use_http: bool):
     account = load_session()
     bg_task = None
+    last_msgs: list[dict] = []  # cache last inbox fetch for read/delete by index
 
     async with aiohttp.ClientSession() as session:
 
@@ -325,7 +416,19 @@ async def main_loop(server: str, use_http: bool):
                 if not account:
                     print("  Not logged in.")
                     continue
-                await fetch_inbox(session, server, account)
+                last_msgs = await fetch_inbox(session, server, account)
+
+            elif cmd == "read":
+                if not account:
+                    print("  Not logged in.")
+                    continue
+                await read_message(session, server, account, last_msgs)
+
+            elif cmd == "delete":
+                if not account:
+                    print("  Not logged in.")
+                    continue
+                await delete_message(session, server, account, last_msgs)
 
             elif cmd == "me":
                 if not account:
@@ -344,6 +447,7 @@ async def main_loop(server: str, use_http: bool):
                     pass
                 clear_session()
                 account = None
+                last_msgs = []
                 if bg_task:
                     bg_task.cancel()
                     bg_task = None

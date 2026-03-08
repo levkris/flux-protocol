@@ -1,4 +1,4 @@
-# FLUX Protocol Specification — v1.0
+# FLUX Protocol Specification - v1.0.0
 
 FLUX (Fast Lightweight Unified eXchange) is a minimal, cryptographically authenticated messaging protocol. It is transport-agnostic, JSON-native, and designed to be simple enough that anyone can implement a client in an afternoon.
 
@@ -11,6 +11,7 @@ FLUX (Fast Lightweight Unified eXchange) is a minimal, cryptographically authent
 - **Content is content.** The body of a message is a plain UTF-8 string. No MIME types, no HTML, no embedded metadata.
 - **Transport is pluggable.** HTTP and WebSocket are first-class. Both use the same message envelope.
 - **Minimal envelope.** Only the fields that are strictly necessary exist.
+- **Messages are never destroyed.** Deletion is a status change, not a physical removal. The server retains all messages permanently.
 
 ---
 
@@ -44,9 +45,15 @@ Every FLUX message is a JSON object with the following fields:
 | `pub`     | string  | yes      | Sender public key bytes (base64url)             |
 | `re`      | string  | no       | Message ID this is a reply to                   |
 
+When messages are returned from the server (inbox, fetch), an additional field is present:
+
+| Field     | Type   | Description                                      |
+|-----------|--------|--------------------------------------------------|
+| `_status` | string | Server-assigned status: `pending`, `delivered`, `read`, or `deleted` |
+
 ### Signing
 
-The signature is computed over the **core fields only** (`v`, `id`, `from`, `to`, `t`, `content`, and `re` if present). The `sig` and `pub` fields are excluded from the signed payload.
+The signature is computed over the **core fields only** (`v`, `id`, `from`, `to`, `t`, `content`, and `re` if present). The `sig`, `pub`, and `_status` fields are excluded from the signed payload.
 
 ```
 core = {v, id, from, to, t, content [, re]}
@@ -64,6 +71,31 @@ A receiving node must:
 4. Reject messages where `abs(now_ms - t) > 300_000` (5 minute clock skew tolerance).
 
 If any check fails, the message is rejected with a `403`.
+
+---
+
+## Message Lifecycle
+
+Messages move through the following statuses. **They are never physically deleted.**
+
+```
+  [sent by sender]
+        │
+        ▼
+    pending        — stored, not yet fetched by recipient
+        │
+        ▼ (fetch or WebSocket drain)
+    delivered      — fetched/pushed, not yet read
+        │
+        ▼ (POST /read or WS read action)
+      read         — recipient has marked as read
+        │
+        ▼ (POST /delete or WS delete action)
+    deleted        — soft-deleted; hidden from default inbox view
+                     but permanently retained on the server
+```
+
+Only the recipient can transition a message to `read` or `deleted`. These operations require the recipient's authentication token.
 
 ---
 
@@ -90,7 +122,8 @@ Submit a message to the node.
 
 ### GET /fetch/{address}
 
-Retrieve and drain all pending messages for an address.
+Drain all **pending** messages for an address, marking them `delivered`.
+Messages are not deleted — they remain on the server with status `delivered`.
 
 **Headers:** `X-Flux-Token: <token>`
 
@@ -99,13 +132,34 @@ Retrieve and drain all pending messages for an address.
 { "ok": true, "messages": [ ... ], "count": 2 }
 ```
 
-Draining is destructive — messages are marked delivered and will not appear again.
+---
+
+### GET /inbox/{address}
+
+Return all messages for an address without consuming them.
+By default, excludes `deleted` messages.
+
+**Headers:** `X-Flux-Token: <token>`
+
+**Query params:**
+- `?status=pending` — only pending messages
+- `?status=delivered` — only delivered messages
+- `?status=read` — only read messages
+- `?status=deleted` — only deleted messages
+- (no param) — all non-deleted messages
+
+**Response:**
+```json
+{ "ok": true, "messages": [ ... ], "count": 5 }
+```
+
+Each message includes a `_status` field.
 
 ---
 
 ### GET /peek/{address}
 
-Check how many messages are pending without consuming them.
+Check how many **pending** messages are waiting without consuming them.
 
 **Headers:** `X-Flux-Token: <token>`
 
@@ -116,18 +170,40 @@ Check how many messages are pending without consuming them.
 
 ---
 
-### POST /ack
+### POST /read
 
-Acknowledge a delivered message. Removes it from the server permanently.
+Mark a message as read. Only the recipient may call this.
+
+**Headers:** `X-Flux-Token: <token>`
 
 **Request body:**
 ```json
-{ "id": "<message_id>" }
+{ "id": "<message_id>", "address": "<recipient_flux_address>" }
 ```
 
 **Response:**
 ```json
-{ "ok": true, "acked": true }
+{ "ok": true, "read": true }
+```
+
+---
+
+### POST /delete
+
+Soft-delete a message. Only the recipient may call this.
+The message is retained on the server permanently with status `deleted`.
+It will no longer appear in the default inbox view.
+
+**Headers:** `X-Flux-Token: <token>`
+
+**Request body:**
+```json
+{ "id": "<message_id>", "address": "<recipient_flux_address>" }
+```
+
+**Response:**
+```json
+{ "ok": true, "deleted": true }
 ```
 
 ---
@@ -152,9 +228,12 @@ Server-wide statistics.
 {
   "ok": true,
   "backend": "sqlite",
-  "queued": 14,
-  "addresses": 3,
-  "delivered_unacked": 2,
+  "total": 42,
+  "pending": 3,
+  "delivered": 5,
+  "read": 31,
+  "deleted": 3,
+  "addresses": 4,
   "online_addresses": 1,
   "ws_connections": 2
 }
@@ -180,18 +259,18 @@ The first frame sent by the client must be an auth frame:
 { "action": "auth", "address": "fx1...", "token": "<token>" }
 ```
 
-On success, the server responds with:
+On success, the server drains any pending messages (marking them `delivered`) and responds with the full inbox:
 
 ```json
 {
   "ok": true,
   "action": "authed",
   "address": "fx1...",
-  "queued": [ ... ]
+  "messages": [ ... ]
 }
 ```
 
-The `queued` array contains any messages that arrived while the client was offline, flushed immediately on connect.
+Each message in `messages` includes a `_status` field.
 
 ---
 
@@ -218,10 +297,30 @@ Inbound messages are pushed as:
 
 ---
 
-### Acknowledging via WebSocket
+### Marking a message as read via WebSocket
 
 ```json
-{ "action": "ack", "id": "<msg_id>" }
+{ "action": "read", "id": "<msg_id>" }
+```
+
+Response:
+```json
+{ "ok": true, "read": true }
+```
+
+The address is taken from the authenticated session — only the connected user's messages can be marked.
+
+---
+
+### Soft-deleting a message via WebSocket
+
+```json
+{ "action": "delete", "id": "<msg_id>" }
+```
+
+Response:
+```json
+{ "ok": true, "deleted": true }
 ```
 
 ---
@@ -239,7 +338,7 @@ Inbound messages are pushed as:
 
 ## Authentication Token
 
-Fetch and peek operations require an `X-Flux-Token` header. The token is derived as:
+Fetch, peek, inbox, read, and delete operations require an `X-Flux-Token` header. The token is derived as:
 
 ```
 token = SHA-256("flux:" + address + ":" + FLUX_SECRET)
@@ -251,7 +350,7 @@ token = SHA-256("flux:" + address + ":" + FLUX_SECRET)
 
 ---
 
-## Message Lifecycle
+## Full Message Lifecycle Diagram
 
 ```
 Client A                   FLUX Node                  Client B
@@ -260,11 +359,13 @@ Client A                   FLUX Node                  Client B
    │                           │── WebSocket push ────────▶│  (if online)
    │◀── { delivery: realtime } │                           │
    │                           │                           │
-   │                           │  (B offline: enqueued)    │
+   │                           │  (B offline: pending)     │
    │                           │                           │
    │                           │◀── WS connect + auth ─────│
-   │                           │─── queued flush ─────────▶│
-   │                           │◀── ack ────────────────────│
+   │                           │─── inbox flush ──────────▶│  (pending→delivered)
+   │                           │                           │
+   │                           │◀── { action: read } ──────│  (delivered→read)
+   │                           │◀── { action: delete } ────│  (read→deleted, retained)
 ```
 
 ---
@@ -291,3 +392,4 @@ The protocol is intentionally minimal. Common extensions:
 - **Threading:** Use the `re` field to chain messages into threads.
 - **Federation:** Nodes can forward messages to other nodes based on address prefix routing.
 - **Groups:** A group is just an address. The holder of the private key distributes to members.
+- **Archiving:** Query `?status=deleted` to implement a trash/archive view.
