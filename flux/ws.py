@@ -6,13 +6,13 @@ from aiohttp import web
 
 from .auth import validate_token
 from .constants import FLUX_VERSION, WS_PING_INTERVAL
-from .message import validate_fields, verify_message, check_freshness, now_ms
+from .message import validate_fields, verify_message, check_freshness, now_ms, append_route, strip_bcc
+from .store import DEFAULT_INBOX
 
 log = logging.getLogger("flux.ws")
 
 
-def make_ws_handler(store, presence):
-    """Return a WebSocket handler bound to a store and presence registry."""
+def make_ws_handler(store, presence, domain: str = "", mesh_relay=None):
 
     async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=WS_PING_INTERVAL)
@@ -32,6 +32,7 @@ def make_ws_handler(store, presence):
 
                     action = frame.get("action")
 
+                    # ── auth ──────────────────────────────────────────────
                     if action == "auth":
                         addr = frame.get("address", "")
                         token = frame.get("token", "")
@@ -44,18 +45,21 @@ def make_ws_handler(store, presence):
                         authed = True
                         await presence.register(address, ws)
 
-                        # Drain pending messages on connect (marks them delivered)
-                        # then return the full inbox so the client has everything
-                        await store.drain(address)
-                        inbox = await store.list_messages(address)
+                        # Drain pending → delivered, then return full inbox
+                        inbox = frame.get("inbox", DEFAULT_INBOX)
+                        await store.drain(address, inbox)
+                        messages = await store.list_messages(address, inbox)
+
                         await ws.send_str(json.dumps({
                             "ok": True,
                             "action": "authed",
                             "address": address,
-                            "messages": inbox,
+                            "inbox": inbox,
+                            "messages": messages,
                         }))
-                        log.info(f"authed {address} ({len(inbox)} messages in inbox)")
+                        log.info(f"authed {address} ({len(messages)} messages in inbox)")
 
+                    # ── send ──────────────────────────────────────────────
                     elif action == "send":
                         if not authed:
                             await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
@@ -66,60 +70,93 @@ def make_ws_handler(store, presence):
                         if not validate_fields(msg):
                             await ws.send_str(json.dumps({"ok": False, "error": "missing fields"}))
                             continue
-
                         if msg.get("v") != FLUX_VERSION:
                             await ws.send_str(json.dumps({"ok": False, "error": "unsupported version"}))
                             continue
-
                         if not check_freshness(msg):
                             await ws.send_str(json.dumps({"ok": False, "error": "clock skew"}))
                             continue
-
                         if not verify_message(msg):
                             await ws.send_str(json.dumps({"ok": False, "error": "invalid signature"}))
                             continue
 
-                        if await presence.deliver(msg["to"], {"type": "msg", "msg": msg}):
+                        hop = domain or request.host
+                        msg = append_route(msg, hop)
+                        msg_clean = strip_bcc(msg)
+
+                        if await presence.deliver(msg_clean["to"], {"type": "msg", "msg": msg_clean}):
                             delivery = "realtime"
                             result = True
                         else:
-                            result = await store.enqueue(msg)
+                            result = await store.enqueue(msg_clean)
                             delivery = "queued" if result else "dropped"
+
+                        mesh_results = {}
+                        if mesh_relay:
+                            mesh_results = await mesh_relay.relay(msg_clean)
 
                         await ws.send_str(json.dumps({
                             "ok": result,
-                            "id": msg["id"],
+                            "id": msg_clean["id"],
                             "delivery": delivery,
+                            "mesh": mesh_results,
                         }))
 
+                    # ── read ──────────────────────────────────────────────
                     elif action == "read":
-                        # Mark a message as read - only the authenticated user's messages
                         if not authed:
                             await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
                             continue
-
                         msg_id = frame.get("id", "")
                         if not msg_id:
                             await ws.send_str(json.dumps({"ok": False, "error": "missing id"}))
                             continue
-
                         found = await store.mark_read(msg_id, address)
                         await ws.send_str(json.dumps({"ok": True, "read": found}))
 
+                    # ── delete ────────────────────────────────────────────
                     elif action == "delete":
-                        # Soft-delete a message - only the authenticated user's messages
                         if not authed:
                             await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
                             continue
-
                         msg_id = frame.get("id", "")
                         if not msg_id:
                             await ws.send_str(json.dumps({"ok": False, "error": "missing id"}))
                             continue
-
                         found = await store.delete_message(msg_id, address)
                         await ws.send_str(json.dumps({"ok": True, "deleted": found}))
 
+                    # ── tag ───────────────────────────────────────────────
+                    elif action == "tag":
+                        if not authed:
+                            await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
+                            continue
+                        msg_id = frame.get("id", "")
+                        tag = frame.get("tag", "").strip().lower()
+                        tag_action = frame.get("tag_action", "add")
+                        if not msg_id or not tag:
+                            await ws.send_str(json.dumps({"ok": False, "error": "missing id or tag"}))
+                            continue
+                        if tag_action == "add":
+                            found = await store.add_tag(msg_id, address, tag)
+                        else:
+                            found = await store.remove_tag(msg_id, address, tag)
+                        await ws.send_str(json.dumps({"ok": True, "tag": tag, "tag_action": tag_action, "applied": found}))
+
+                    # ── move ──────────────────────────────────────────────
+                    elif action == "move":
+                        if not authed:
+                            await ws.send_str(json.dumps({"ok": False, "error": "not authenticated"}))
+                            continue
+                        msg_id = frame.get("id", "")
+                        inbox = frame.get("inbox", "").strip()
+                        if not msg_id or not inbox:
+                            await ws.send_str(json.dumps({"ok": False, "error": "missing id or inbox"}))
+                            continue
+                        found = await store.move_inbox(msg_id, address, inbox)
+                        await ws.send_str(json.dumps({"ok": True, "moved": found, "inbox": inbox}))
+
+                    # ── ping ──────────────────────────────────────────────
                     elif action == "ping":
                         await ws.send_str(json.dumps({"ok": True, "action": "pong", "t": now_ms()}))
 

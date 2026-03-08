@@ -3,9 +3,10 @@ import logging
 import aiohttp
 from aiohttp import web
 
-from .constants import FLUX_VERSION
+from .constants import FLUX_VERSION, FLUX_API_VERSION
 from .federation import parse_federated, is_local, resolve_address
-from .message import build_message, validate_fields, verify_message, check_freshness, now_ms
+from .message import build_message, validate_fields, verify_message, check_freshness, now_ms, strip_bcc, append_route
+from .store import DEFAULT_INBOX
 
 log = logging.getLogger("flux.account_routes")
 
@@ -22,7 +23,6 @@ def _err(msg: str, status: int = 400) -> web.Response:
 
 
 def _require_session(handler):
-    """Decorator that validates X-Flux-Session and injects username into request."""
     async def wrapper(request: web.Request):
         token = request.headers.get("X-Flux-Session", "")
         if not token:
@@ -36,15 +36,10 @@ def _require_session(handler):
 
 
 def make_account_routes(domain: str):
-    """
-    Returns account + federation route handlers bound to a domain name.
-    The domain is used to determine which addresses are local vs remote.
-    """
 
     # --- Account management ---
 
     async def route_register(request: web.Request) -> web.Response:
-        """Create a new account with password auth."""
         try:
             body = await request.json()
         except Exception:
@@ -63,9 +58,7 @@ def make_account_routes(domain: str):
 
         try:
             account = await request.app["accounts"].create_account(
-                username=username,
-                display_name=display_name,
-                password=password,
+                username=username, display_name=display_name, password=password,
             )
         except ValueError as e:
             return _err(str(e), 409)
@@ -79,7 +72,6 @@ def make_account_routes(domain: str):
         })
 
     async def route_login(request: web.Request) -> web.Response:
-        """Authenticate with username + password. Returns a session token."""
         try:
             body = await request.json()
         except Exception:
@@ -108,7 +100,6 @@ def make_account_routes(domain: str):
 
     @_require_session
     async def route_me(request: web.Request) -> web.Response:
-        """Return the current user's profile."""
         username = request["username"]
         account = await request.app["accounts"].get_by_username(username)
         return _ok({
@@ -118,17 +109,16 @@ def make_account_routes(domain: str):
             "display_name": account["display_name"],
         })
 
-    # --- Federated send ---
+    # --- Send ---
 
     @_require_session
     async def route_federated_send(request: web.Request) -> web.Response:
         """
-        Send a message using federated addressing (user@domain).
+        Send a message with full envelope support:
+        subject, cc, bcc, tags, reply_to (re), expires.
 
-        The server:
-        1. Looks up the sender's FLUX identity
-        2. Resolves the recipient address (local lookup or remote federation query)
-        3. Signs and delivers the message
+        BCC recipients each receive a separate copy with BCC stripped.
+        CC recipients receive a copy with the CC list intact.
         """
         try:
             body = await request.json()
@@ -137,7 +127,12 @@ def make_account_routes(domain: str):
 
         to_address = body.get("to", "").strip()
         content = body.get("content", "")
-        reply_to = body.get("reply_to")
+        subject = body.get("subject")
+        reply_to = body.get("reply_to") or body.get("re")
+        cc_raw: list[str] = body.get("cc") or []
+        bcc_raw: list[str] = body.get("bcc") or []
+        tags: list[str] = body.get("tags") or []
+        expires = body.get("expires")  # unix ms or None
 
         if not to_address or not content:
             return _err("missing 'to' or 'content'")
@@ -147,36 +142,69 @@ def make_account_routes(domain: str):
         if not identity:
             return _err("sender identity not found", 500)
 
-        # Resolve recipient to a raw fx1 address
-        parsed = parse_federated(to_address)
-
-        if parsed is None:
-            # Already a raw fx1 address
-            fx1_address = to_address
-        elif is_local(to_address, domain):
-            recipient_username = parsed[0]
-            profile = await request.app["accounts"].get_public_profile(recipient_username)
-            if not profile:
-                return _err(f"user '{recipient_username}' not found on this server", 404)
-            fx1_address = profile["flux_address"]
-        else:
-            # Remote — ask the other server for their address
-            async with aiohttp.ClientSession() as session:
-                fx1_address = await resolve_address(to_address, domain, session)
-            if not fx1_address:
-                return _err(f"could not resolve remote address: {to_address}", 404)
-
-        msg = build_message(identity, fx1_address, content, reply_to)
-
-        # Attempt real-time delivery first, then queue
         store = request.app["store"]
         presence = request.app["presence"]
 
-        if await presence.deliver(fx1_address, {"type": "msg", "msg": msg}):
-            delivery = "realtime"
-        else:
-            queued = await store.enqueue(msg)
-            delivery = "queued" if queued else "dropped"
+        async def resolve(addr: str) -> str | None:
+            """Resolve any address format to a raw fx1 address."""
+            parsed = parse_federated(addr)
+            if parsed is None:
+                return addr  # already fx1
+            if is_local(addr, domain):
+                profile = await request.app["accounts"].get_public_profile(parsed[0])
+                return profile["flux_address"] if profile else None
+            async with aiohttp.ClientSession() as s:
+                return await resolve_address(addr, domain, s)
+
+        async def deliver_one(fx1_to: str, msg: dict) -> str:
+            msg = append_route(msg, domain)
+            msg_clean = strip_bcc(msg)
+            if await presence.deliver(fx1_to, {"type": "msg", "msg": msg_clean}):
+                return "realtime"
+            queued = await store.enqueue(msg_clean)
+            return "queued" if queued else "dropped"
+
+        # --- Primary recipient ---
+        fx1_to = await resolve(to_address)
+        if not fx1_to:
+            return _err(f"could not resolve: {to_address}", 404)
+
+        msg = build_message(
+            identity, fx1_to, content,
+            subject=subject, reply_to=reply_to,
+            cc=cc_raw, bcc=bcc_raw,
+            tags=tags, expires=expires,
+        )
+        primary_delivery = await deliver_one(fx1_to, msg)
+
+        # --- CC recipients ---
+        cc_results = {}
+        for cc_addr in cc_raw:
+            fx1_cc = await resolve(cc_addr)
+            if fx1_cc:
+                cc_msg = build_message(
+                    identity, fx1_cc, content,
+                    subject=subject, reply_to=reply_to,
+                    cc=cc_raw, tags=tags, expires=expires,
+                )
+                cc_results[cc_addr] = await deliver_one(fx1_cc, cc_msg)
+            else:
+                cc_results[cc_addr] = "unresolved"
+
+        # --- BCC recipients (each gets a copy with BCC stripped) ---
+        bcc_results = {}
+        for bcc_addr in bcc_raw:
+            fx1_bcc = await resolve(bcc_addr)
+            if fx1_bcc:
+                bcc_msg = build_message(
+                    identity, fx1_bcc, content,
+                    subject=subject, reply_to=reply_to,
+                    cc=cc_raw, tags=tags, expires=expires,
+                    # No bcc= field on BCC copies
+                )
+                bcc_results[bcc_addr] = await deliver_one(fx1_bcc, bcc_msg)
+            else:
+                bcc_results[bcc_addr] = "unresolved"
 
         sender_display = await _sender_display(request.app["accounts"], sender_username, domain)
 
@@ -185,8 +213,10 @@ def make_account_routes(domain: str):
             "from": f"{sender_username}@{domain}",
             "from_display": sender_display,
             "to": to_address,
-            "fx1_to": fx1_address,
-            "delivery": delivery,
+            "fx1_to": fx1_to,
+            "delivery": primary_delivery,
+            "cc": cc_results,
+            "bcc": bcc_results,
         })
 
     # --- Inbox ---
@@ -195,36 +225,45 @@ def make_account_routes(domain: str):
     async def route_fetch_inbox(request: web.Request) -> web.Response:
         """
         Return all messages for the authenticated user.
-        Accepts optional ?status= query param (pending, delivered, read).
-        Messages are never deleted — this is a persistent inbox.
-        Pending messages are marked as delivered when fetched.
+        Query params: ?inbox=  ?status=  ?tag=
+        Pending messages are marked delivered on fetch.
+        Messages are never deleted.
         """
         username = request["username"]
         account = await request.app["accounts"].get_by_username(username)
         fx1_address = account["flux_address"]
 
+        inbox = request.rel_url.query.get("inbox", DEFAULT_INBOX)
         status_filter = request.rel_url.query.get("status")
+        tag_filter = request.rel_url.query.get("tag")
 
-        # Drain pending → delivered first so the inbox reflects current state
-        await request.app["store"].drain(fx1_address)
-
-        msgs = await request.app["store"].list_messages(fx1_address, status=status_filter)
+        await request.app["store"].drain(fx1_address, inbox)
+        msgs = await request.app["store"].list_messages(fx1_address, inbox, status=status_filter, tag=tag_filter)
         return _ok({"messages": msgs, "count": len(msgs)})
+
+    @_require_session
+    async def route_list_inboxes(request: web.Request) -> web.Response:
+        username = request["username"]
+        account = await request.app["accounts"].get_by_username(username)
+        inboxes = await request.app["store"].list_inboxes(account["flux_address"])
+        # Always include the default inbox even if empty
+        if DEFAULT_INBOX not in inboxes:
+            inboxes = [DEFAULT_INBOX] + inboxes
+        return _ok({"inboxes": inboxes})
 
     @_require_session
     async def route_peek_inbox(request: web.Request) -> web.Response:
         username = request["username"]
         account = await request.app["accounts"].get_by_username(username)
-        fx1_address = account["flux_address"]
-
-        count = await request.app["store"].peek_count(fx1_address)
+        inbox = request.rel_url.query.get("inbox", DEFAULT_INBOX)
+        count = await request.app["store"].peek_count(account["flux_address"], inbox)
         return _ok({"count": count})
 
     @_require_session
     async def route_read_message(request: web.Request) -> web.Response:
         """
-        Mark a message as read.
-        Only the authenticated recipient can mark their own messages.
+        Mark a message as read. Status moves: pending/delivered → read.
+        If the message has an 'expires' property, it is soft-deleted instead.
         """
         try:
             body = await request.json()
@@ -237,19 +276,14 @@ def make_account_routes(domain: str):
 
         username = request["username"]
         account = await request.app["accounts"].get_by_username(username)
-        fx1_address = account["flux_address"]
-
-        found = await request.app["store"].mark_read(msg_id, fx1_address)
+        found = await request.app["store"].mark_read(msg_id, account["flux_address"])
         if not found:
             return _err("message not found or already read", 404)
         return _ok({"read": True})
 
     @_require_session
     async def route_delete_message(request: web.Request) -> web.Response:
-        """
-        Soft-delete a message (marks it as 'deleted', never physically removed).
-        Only the authenticated recipient can delete their own messages.
-        """
+        """Soft-delete a message. Retained on server, hidden from default inbox view."""
         try:
             body = await request.json()
         except Exception:
@@ -261,22 +295,66 @@ def make_account_routes(domain: str):
 
         username = request["username"]
         account = await request.app["accounts"].get_by_username(username)
-        fx1_address = account["flux_address"]
-
-        found = await request.app["store"].delete_message(msg_id, fx1_address)
+        found = await request.app["store"].delete_message(msg_id, account["flux_address"])
         if not found:
             return _err("message not found or already deleted", 404)
         return _ok({"deleted": True})
 
-    # --- Federation endpoint (called by remote servers) ---
+    @_require_session
+    async def route_tag_message(request: web.Request) -> web.Response:
+        """
+        Add or remove a tag on a message.
+        Body: {id, tag, action: 'add'|'remove'}
+        Reserved global tags: 'important', 'favorited'.
+        Custom tags are allowed.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _err("invalid json")
+
+        msg_id = body.get("id", "")
+        tag = body.get("tag", "").strip().lower()
+        action = body.get("action", "add")
+
+        if not msg_id or not tag:
+            return _err("missing 'id' or 'tag'")
+        if action not in ("add", "remove"):
+            return _err("action must be 'add' or 'remove'")
+
+        username = request["username"]
+        account = await request.app["accounts"].get_by_username(username)
+        fx1 = account["flux_address"]
+
+        if action == "add":
+            found = await request.app["store"].add_tag(msg_id, fx1, tag)
+        else:
+            found = await request.app["store"].remove_tag(msg_id, fx1, tag)
+
+        return _ok({"tag": tag, "action": action, "applied": found})
+
+    @_require_session
+    async def route_move_message(request: web.Request) -> web.Response:
+        """Move a message to a different inbox. Body: {id, inbox}"""
+        try:
+            body = await request.json()
+        except Exception:
+            return _err("invalid json")
+
+        msg_id = body.get("id", "")
+        inbox = body.get("inbox", "").strip()
+
+        if not msg_id or not inbox:
+            return _err("missing 'id' or 'inbox'")
+
+        username = request["username"]
+        account = await request.app["accounts"].get_by_username(username)
+        found = await request.app["store"].move_inbox(msg_id, account["flux_address"], inbox)
+        return _ok({"moved": found, "inbox": inbox})
+
+    # --- Federation ---
 
     async def route_federation_resolve(request: web.Request) -> web.Response:
-        """
-        Federation endpoint. Remote servers call this to look up a local user's
-        FLUX address before sending them a message.
-
-        Returns the public profile only — no private key, no session info.
-        """
         username = request.match_info["username"].lower()
         profile = await request.app["accounts"].get_public_profile(username)
         if not profile:
@@ -284,12 +362,7 @@ def make_account_routes(domain: str):
         return _ok(profile)
 
     async def route_federation_info(request: web.Request) -> web.Response:
-        """Returns metadata about this FLUX node for discovery."""
-        return _ok({
-            "domain": domain,
-            "version": FLUX_VERSION,
-            "federation": True,
-        })
+        return _ok({"domain": domain, "version": FLUX_API_VERSION, "protocol": FLUX_VERSION, "federation": True})
 
     return [
         web.post("/account/register", route_register),
@@ -298,9 +371,12 @@ def make_account_routes(domain: str):
         web.get("/account/me", route_me),
         web.post("/mail/send", route_federated_send),
         web.get("/mail/inbox", route_fetch_inbox),
+        web.get("/mail/inboxes", route_list_inboxes),
         web.get("/mail/peek", route_peek_inbox),
         web.post("/mail/read", route_read_message),
         web.post("/mail/delete", route_delete_message),
+        web.post("/mail/tag", route_tag_message),
+        web.post("/mail/move", route_move_message),
         web.get("/federation/resolve/{username}", route_federation_resolve),
         web.get("/federation/info", route_federation_info),
     ]

@@ -36,3 +36,5 @@ identities/
 Thumbs.db
 
 .flux_session.json
+
+mesh.config.json
