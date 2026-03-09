@@ -17,7 +17,7 @@
 
 #### 2.1.0
 **Added:**
-- `integrity_chain` envelope field — append-only list of per-hop SHA-256 records.
+- `integrity_chain` envelope field - append-only list of per-hop SHA-256 records.
 - `encrypted`, `content_enc`, `enc_recipients` envelope fields for E2E encryption.
 - Tamper detection, TamperReport broadcast, and server quarantine system.
 - Built-in spam detection (`flux/spam.py`).
@@ -79,7 +79,7 @@ address = "fx1" + SHA-256(public_key_bytes)[0:40 hex chars]
 | `subject`      | string      | no       | Human-readable subject line |
 | `re`           | string      | no       | Message ID this replies to |
 | `cc`           | string[]    | no       | CC recipient FLUX addresses |
-| `bcc`          | string[]    | no       | BCC recipients — stripped before delivery |
+| `bcc`          | string[]    | no       | BCC recipients - stripped before delivery |
 | `tags`         | string[]    | no       | Lowercase tags. Reserved: `important`, `favorited` |
 | `expires`      | integer\|0  | no       | Soft-delete after first read if present. `0` = expire on any read. |
 
@@ -87,8 +87,8 @@ address = "fx1" + SHA-256(public_key_bytes)[0:40 hex chars]
 
 | Field             | Type      | Description |
 |-------------------|-----------|-------------|
-| `route`           | object[]  | `[{server, t}, …]` — each server appends itself on receipt |
-| `integrity_chain` | object[]  | `[HopRecord, …]` — see below |
+| `route`           | object[]  | `[{server, t}, …]` - each server appends itself on receipt |
+| `integrity_chain` | object[]  | `[HopRecord, …]` - see below |
 
 ### E2E encryption fields (set by sender)
 
@@ -153,7 +153,7 @@ To verify the chain:
 2. For each HopRecord in order:
    a. Verify the hop's `sig` against `server:t:hash` using the hop's `pub`.
    b. Confirm `hash` equals the baseline hash.
-   c. The baseline hash does not change between hops — any alteration of the protected fields would produce a different hash.
+   c. The baseline hash does not change between hops - any alteration of the protected fields would produce a different hash.
 3. If any hop fails either check, identify the offending server and emit a TamperReport.
 
 ### TamperReport
@@ -219,7 +219,7 @@ CEK           = AES-256-GCM-decrypt(wrap_key, wrapped_cek)
 content       = AES-256-GCM-decrypt(CEK, base64url_decode(content_enc))
 ```
 
-The server never has access to `CEK` or the private keys — decryption is always done client-side.
+The server never has access to `CEK` or the private keys - decryption is always done client-side.
 
 ---
 
@@ -246,16 +246,16 @@ Spam is rejected with HTTP 451 before storage.
   enqueued
       │
       ▼
-  pending       — stored, not yet fetched
+  pending       - stored, not yet fetched
       │
       ▼  fetch / WS drain
-  delivered     — fetched or pushed, not yet read
+  delivered     - fetched or pushed, not yet read
       │
       ▼  POST /read  or  WS { action: "read" }
-    read         — explicitly marked read
+    read         - explicitly marked read
       │             if `expires` set → goes to deleted
       ▼  POST /delete  or  WS { action: "delete" }
-  deleted        — soft-deleted; hidden; permanently retained
+  deleted        - soft-deleted; hidden; permanently retained
 ```
 
 ---
@@ -407,7 +407,7 @@ Response:
 | `delete` | `id`        | Soft-delete |
 | `tag`    | `id`, `tag`, `tag_action: "add"\|"remove"` | Tag a message |
 | `move`   | `id`, `inbox` | Move to inbox |
-| `ping`   | —           | Heartbeat |
+| `ping`   | -           | Heartbeat |
 
 ---
 
