@@ -24,7 +24,7 @@ Server A:
   { signed message envelope, to: "fx1bob…" }
 ```
 
-The federation resolve endpoint only returns the public key and address — never credentials or private information.
+The federation resolve endpoint only returns the public key and address - never credentials or private information.
 
 **Note:** FLUX uses HTTPS by default for all federated server-to-server communication. HTTP is only used for localhost or when a port is explicitly specified (development mode).
 
@@ -75,24 +75,24 @@ Federated addresses follow `username@domain` format:
 - `alice@mail.mycompany.com`
 - `bob@localhost:8765` (local development)
 
-Raw `fx1…` addresses always work too — they bypass federation lookup entirely.
+Raw `fx1…` addresses always work too - they bypass federation lookup entirely.
 
 ---
 
 ## Running Two Servers Locally
 
 ```bash
-# Terminal 1 — Server A on port 8765
+# Terminal 1 - Server A on port 8765
 python main.py server --port 8765 --backend sqlite --domain localhost:8765
 
-# Terminal 2 — Server B on port 8766
+# Terminal 2 - Server B on port 8766
 python main.py server --port 8766 --backend sqlite --domain localhost:8766
 
-# Terminal 3 — register alice on Server A
+# Terminal 3 - register alice on Server A
 python test_client.py --server http://localhost:8765
 # > register
 
-# Terminal 4 — register bob on Server B
+# Terminal 4 - register bob on Server B
 python test_client.py --server http://localhost:8766
 # > register
 
@@ -105,7 +105,7 @@ python test_client.py --server http://localhost:8766
 ## Security
 
 - **HTTPS by default:** All federated server-to-server communication uses HTTPS to protect against man-in-the-middle attacks. HTTP is only used for localhost or explicit port specifications (development mode).
-- **Public endpoints:** The resolve endpoint is public and unauthenticated — it only exposes what a public directory would.
+- **Public endpoints:** The resolve endpoint is public and unauthenticated - it only exposes what a public directory would.
 - **Message integrity:** Message signatures are always verified end-to-end. A malicious server cannot forge messages from its users.
 - **Tamper detection:** If a message passes through a malicious relay that modifies it, the integrity chain detects the tampering. The detecting server broadcasts a validated tamper report to all servers in the message's route and mesh peers.
 - **Tamper report validation:** Servers receiving tamper reports verify the integrity chain to confirm actual tampering occurred before recording strikes. This prevents malicious actors from sending fabricated reports to frame innocent servers.
